@@ -1,6 +1,6 @@
 # MP3_Player
 
-A Python desktop MP3 player built with Tkinter and Pygame. Its dark, three-panel interface keeps your local library, track list, and current track visible alongside playback controls. The compact player bar displays embedded MP3 cover art when available, track progress and duration, seek controls, and volume. Load music from a local folder, browse and search your playlist, sort tracks by name or folder order, and play, pause, resume, stop, or skip between tracks.
+A Python desktop MP3 player built with Tkinter and Pygame. Its dark, three-panel interface keeps your local library, track list, and current track visible alongside playback controls. A custom navigation bar provides menu, track navigation, home/search, help, and profile actions; on Windows, it also replaces the native title bar with draggable minimize, maximize, and close controls. The compact player bar displays embedded MP3 cover art when available, track progress and duration, seek controls, and volume. Load music from a local folder, browse and search your playlist, sort tracks by name or folder order, and play, pause, resume, stop, or skip between tracks.
 
 Save playlists as JSON files and reopen them later. Playlist files store music paths, so the original audio files must remain available at those locations (relative paths are resolved from the playlist file's folder).
 

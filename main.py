@@ -1,5 +1,7 @@
+import ctypes
 import json
 import os
+import sys
 import tkinter as tk
 import time
 from io import BytesIO
@@ -36,6 +38,7 @@ class MP3Player:
         self.playback_started_at = None
         self.seeking = False
         self.progress_after_id = None
+        self.search_placeholder_visible = False
 
         try:
             pygame.mixer.init()
@@ -49,6 +52,7 @@ class MP3Player:
             return
 
         self.build_interface()
+        self.configure_custom_title_bar()
         self.root.protocol("WM_DELETE_WINDOW", self.close_app)
 
     def build_interface(self):
@@ -73,31 +77,59 @@ class MP3Player:
         self.root.columnconfigure(0, weight=1)
         self.status = tk.StringVar(value="Load a folder to get started.")
 
-        top_bar = tk.Frame(self.root, bg="#050505", height=62)
+        top_bar = tk.Frame(self.root, bg="#050505", height=58)
         top_bar.grid(row=0, column=0, sticky="ew")
         top_bar.grid_propagate(False)
         top_bar.columnconfigure(1, weight=1)
+        self.top_bar = top_bar
 
-        tk.Label(
-            top_bar,
-            text="MP3 PLAYER",
-            font=("Arial", 13, "bold"),
-            bg="#050505",
-            fg="#ffffff"
-        ).grid(row=0, column=0, padx=24, sticky="w")
+        navigation = tk.Frame(top_bar, bg="#050505")
+        navigation.grid(row=0, column=0, padx=(14, 8), sticky="w")
+        navigation.bind("<ButtonPress-1>", self.start_window_drag)
+        menu_button = self._make_button(
+            navigation, "•••", self.show_app_menu
+        )
+        menu_button.configure(width=3, font=("Arial", 12, "bold"))
+        menu_button.pack(side=tk.LEFT, padx=(0, 9))
+        for label, command in (
+            ("‹", self.previous_music),
+            ("›", self.next_music)
+        ):
+            button = self._make_button(navigation, label, command)
+            button.configure(
+                width=2,
+                font=("Arial", 20),
+                padx=2,
+                pady=0,
+                fg="#aaaaaa"
+            )
+            button.pack(side=tk.LEFT, padx=2)
 
         search_box = tk.Frame(top_bar, bg="#242424")
-        search_box.grid(row=0, column=1, padx=20, pady=11, sticky="ew")
+        search_box.grid(row=0, column=1, padx=18, pady=8, sticky="ew")
+        search_box.bind("<ButtonPress-1>", self.start_window_drag)
+        search_box.columnconfigure(2, weight=1)
+        home_button = self._make_button(
+            search_box, "⌂", self.go_home, accent=True
+        )
+        home_button.configure(
+            font=("Segoe UI Symbol", 19, "bold"),
+            width=3,
+            padx=4,
+            pady=2
+        )
+        home_button.grid(row=0, column=0, padx=(0, 10))
         tk.Label(
             search_box,
-            text="Search",
+            text="⌕",
+            font=("Arial", 20),
             bg="#242424",
             fg="#aaaaaa",
-            padx=12
-        ).pack(side=tk.LEFT)
+            padx=4
+        ).grid(row=0, column=1, sticky="w")
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self.filter_playlist)
-        tk.Entry(
+        self.search_entry = tk.Entry(
             search_box,
             textvariable=self.search_var,
             bg="#242424",
@@ -105,15 +137,63 @@ class MP3Player:
             insertbackground="#ffffff",
             relief=tk.FLAT,
             font=("Arial", 11)
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8, padx=(0, 12))
+        )
+        self.search_entry.grid(
+            row=0, column=2, sticky="ew", ipady=8, padx=(2, 14)
+        )
+        self.search_placeholder = "What do you want to play?"
+        self.search_entry.bind("<FocusIn>", self.clear_search_placeholder)
+        self.search_entry.bind("<FocusOut>", self.restore_search_placeholder)
+        self.search_entry.bind("<Escape>", self.clear_search)
+        self.restore_search_placeholder()
 
-        tk.Label(
-            top_bar,
-            text="LOCAL MUSIC",
-            font=("Arial", 9, "bold"),
-            bg="#050505",
-            fg="#b3b3b3"
-        ).grid(row=0, column=2, padx=24)
+        right_controls = tk.Frame(top_bar, bg="#050505")
+        right_controls.grid(row=0, column=2, padx=(4, 0), sticky="e")
+        help_button = self._make_button(right_controls, "?", self.show_help)
+        help_button.configure(width=3, font=("Arial", 11, "bold"))
+        help_button.pack(side=tk.LEFT, padx=3)
+        profile_button = self._make_button(
+            right_controls, "M", self.show_about, accent=True
+        )
+        profile_button.configure(
+            width=3,
+            font=("Arial", 11, "bold"),
+            relief=tk.FLAT,
+            highlightthickness=2,
+            highlightbackground="#1ed760"
+        )
+        profile_button.pack(side=tk.LEFT, padx=(7, 12))
+
+        self.window_controls = tk.Frame(top_bar, bg="#050505")
+        self.window_controls.grid(row=0, column=3, sticky="e")
+        for label, command in (
+            ("_", self.minimize_window),
+            ("□", self.toggle_maximize_window),
+            ("X", self.close_app)
+        ):
+            button = tk.Button(
+                self.window_controls,
+                text=label,
+                command=command,
+                bg="#050505",
+                fg="#dddddd",
+                activebackground="#333333",
+                activeforeground="#ffffff",
+                font=("Arial", 10),
+                relief=tk.FLAT,
+                width=5,
+                height=2,
+                bd=0,
+                cursor="hand2"
+            )
+            if label == "X":
+                button.configure(
+                    activebackground="#c42b1c",
+                    activeforeground="#ffffff"
+                )
+            button.pack(side=tk.LEFT, fill=tk.Y)
+        top_bar.columnconfigure(3, weight=0)
+        top_bar.bind("<ButtonPress-1>", self.start_window_drag)
 
         workspace = tk.Frame(self.root, bg="#000000")
         workspace.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 8))
@@ -479,6 +559,154 @@ class MP3Player:
             cursor="hand2"
         )
 
+    def configure_custom_title_bar(self):
+        if sys.platform != "win32":
+            self.window_controls.grid_remove()
+            return
+
+        self.root.update_idletasks()
+        user32 = ctypes.windll.user32
+        hwnd = ctypes.c_void_p(self.root.winfo_id())
+        pointer_suffix = "PtrW" if ctypes.sizeof(ctypes.c_void_p) == 8 else "W"
+        get_window_long = getattr(
+            user32, f"GetWindowLong{pointer_suffix}"
+        )
+        get_window_long.argtypes = (ctypes.c_void_p, ctypes.c_int)
+        get_window_long.restype = ctypes.c_ssize_t
+        set_window_long = getattr(
+            user32, f"SetWindowLong{pointer_suffix}"
+        )
+        set_window_long.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_ssize_t
+        )
+        set_window_long.restype = ctypes.c_ssize_t
+
+        style = get_window_long(hwnd, -16)
+        style &= ~0x00C00000
+        style |= 0x00040000 | 0x00080000 | 0x00020000 | 0x00010000
+        set_window_long(hwnd, -16, style)
+
+        set_window_pos = user32.SetWindowPos
+        set_window_pos.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint
+        )
+        set_window_pos.restype = ctypes.c_int
+        if not set_window_pos(hwnd, None, 0, 0, 0, 0, 0x0027):
+            raise ctypes.WinError()
+
+    def start_window_drag(self, event=None):
+        if sys.platform == "win32":
+            user32 = ctypes.windll.user32
+            hwnd = ctypes.c_void_p(self.root.winfo_id())
+            user32.ReleaseCapture.restype = ctypes.c_int
+            send_message = user32.SendMessageW
+            send_message.argtypes = (
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_size_t,
+                ctypes.c_ssize_t
+            )
+            send_message.restype = ctypes.c_ssize_t
+            send_message(hwnd, 0x00A1, 0x0002, 0)
+            return "break"
+
+        if event is not None:
+            self.drag_start_x = event.x_root
+            self.drag_start_y = event.y_root
+            self.window_start_x = self.root.winfo_x()
+            self.window_start_y = self.root.winfo_y()
+            self.top_bar.bind("<B1-Motion>", self.drag_window)
+
+    def drag_window(self, event):
+        x = self.window_start_x + event.x_root - self.drag_start_x
+        y = self.window_start_y + event.y_root - self.drag_start_y
+        self.root.geometry(f"+{x}+{y}")
+
+    def minimize_window(self):
+        self.root.iconify()
+
+    def toggle_maximize_window(self):
+        if self.root.state() == "zoomed":
+            self.root.state("normal")
+            self.window_controls.winfo_children()[1].configure(text="□")
+        else:
+            self.root.state("zoomed")
+            self.window_controls.winfo_children()[1].configure(text="❐")
+
+    def go_home(self):
+        self.set_search_query("")
+        self.search_entry.focus_set()
+        self.search_entry.icursor(tk.END)
+
+    def clear_search(self, _event=None):
+        self.set_search_query("")
+        self.search_entry.focus_set()
+        return "break"
+
+    def set_search_query(self, query):
+        self.search_placeholder_visible = False
+        self.search_var.set(query)
+        if not query and self.root.focus_get() is not self.search_entry:
+            self.restore_search_placeholder()
+
+    def clear_search_placeholder(self, _event=None):
+        if self.search_placeholder_visible:
+            self.search_placeholder_visible = False
+            self.search_var.set("")
+            self.search_entry.configure(fg="#ffffff")
+
+    def restore_search_placeholder(self, _event=None):
+        if not self.search_var.get():
+            self.search_placeholder_visible = True
+            self.search_var.set(self.search_placeholder)
+            self.search_entry.configure(fg="#aaaaaa")
+
+    def show_app_menu(self):
+        menu = tk.Menu(
+            self.root,
+            tearoff=False,
+            bg="#242424",
+            fg="#ffffff",
+            activebackground="#333333",
+            activeforeground="#ffffff"
+        )
+        menu.add_command(label="Load music folder...", command=self.load_music)
+        menu.add_command(label="Open playlist...", command=self.open_playlist)
+        menu.add_command(label="Save playlist...", command=self.save_playlist)
+        menu.add_separator()
+        menu.add_command(label="About MP3 Player", command=self.show_about)
+        try:
+            menu.tk_popup(
+                self.top_bar.winfo_rootx() + 10,
+                self.top_bar.winfo_rooty() + self.top_bar.winfo_height()
+            )
+        finally:
+            menu.grab_release()
+
+    def show_help(self):
+        messagebox.showinfo(
+            "MP3 Player Help",
+            "Load a folder or open a saved playlist. Search by track name, "
+            "double-click a track to play it, and use the bottom controls "
+            "to seek, adjust volume, or move between tracks.",
+            parent=self.root
+        )
+
+    def show_about(self):
+        messagebox.showinfo(
+            "About MP3 Player",
+            "MP3 Player\nLocal music playback with Tkinter and Pygame.",
+            parent=self.root
+        )
+
     @staticmethod
     def format_time(seconds):
         total_seconds = max(0, int(seconds))
@@ -693,7 +921,7 @@ class MP3Player:
         self.playlist.delete(0, tk.END)
         self.sort_order = "name_asc"
         self.sort_var.set("Name (A-Z)")
-        self.search_var.set("")
+        self.set_search_query("")
         self.apply_sort_order()
         self.update_track_display()
 
@@ -710,6 +938,8 @@ class MP3Player:
             )
 
     def filter_playlist(self, *_):
+        if self.search_placeholder_visible:
+            return
         self.refresh_playlist()
 
     def change_sort_order(self, _event=None):
@@ -794,7 +1024,11 @@ class MP3Player:
                     ),
                     None
                 )
-        query = self.search_var.get().strip().casefold()
+        query = (
+            ""
+            if self.search_placeholder_visible
+            else self.search_var.get().strip().casefold()
+        )
         self.displayed_song_indices = [
             index for index, song in enumerate(self.songs)
             if query in os.path.basename(song).casefold()
@@ -912,7 +1146,7 @@ class MP3Player:
             "folder": "Folder order"
         }[sort_order])
         self.current_song_index = None
-        self.search_var.set("")
+        self.set_search_query("")
         self.apply_sort_order()
         if self.songs:
             self.playlist.selection_set(0)
