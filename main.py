@@ -963,19 +963,7 @@ class MP3Player:
             self.search_entry.configure(fg="#aaaaaa")
 
     def show_app_menu(self):
-        menu = tk.Menu(
-            self.root,
-            tearoff=False,
-            bg="#242424",
-            fg="#ffffff",
-            activebackground="#333333",
-            activeforeground="#ffffff"
-        )
-        menu.add_command(label="Load music folder...", command=self.load_music)
-        menu.add_command(label="Open playlist...", command=self.open_playlist)
-        menu.add_command(label="Save playlist...", command=self.save_playlist)
-        menu.add_separator()
-        menu.add_command(label="About MP3 Player", command=self.show_about)
+        menu = self.build_app_menu()
         try:
             menu.tk_popup(
                 self.top_bar.winfo_rootx() + 10,
@@ -983,6 +971,106 @@ class MP3Player:
             )
         finally:
             menu.grab_release()
+
+    def build_app_menu(self):
+        menu_style = {
+            "tearoff": False,
+            "bg": "#181818",
+            "fg": "#eeeeee",
+            "activebackground": "#333333",
+            "activeforeground": "#ffffff",
+            "disabledforeground": "#777777",
+            "borderwidth": 0,
+            "activeborderwidth": 0,
+            "font": ("Arial", 10),
+            "relief": tk.FLAT
+        }
+        menu = tk.Menu(self.root, **menu_style)
+
+        file_menu = tk.Menu(menu, **menu_style)
+        file_menu.add_command(
+            label="Load music folder...",
+            command=self.load_music
+        )
+        file_menu.add_command(
+            label="Open playlist...",
+            command=self.open_playlist
+        )
+        file_menu.add_command(
+            label="Save playlist...",
+            command=self.save_playlist
+        )
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.close_app)
+        menu.add_cascade(label="File", menu=file_menu)
+
+        edit_menu = tk.Menu(menu, **menu_style)
+        edit_menu.add_command(
+            label="Clear search",
+            command=self.clear_search
+        )
+        edit_menu.add_command(
+            label="Search tracks",
+            command=lambda: self.search_entry.focus_set()
+        )
+        menu.add_cascade(label="Edit", menu=edit_menu)
+
+        view_menu = tk.Menu(menu, **menu_style)
+        for category in ("Tracks", "Folders", "Playlists"):
+            view_menu.add_command(
+                label=f"Library: {category}",
+                command=lambda value=category: self.set_library_category(
+                    value
+                )
+            )
+        view_menu.add_separator()
+        view_menu.add_command(
+            label="Expand library",
+            command=self.toggle_library_expansion
+        )
+        view_menu.add_command(
+            label="Maximize window",
+            command=self.toggle_maximize_window
+        )
+        menu.add_cascade(label="View", menu=view_menu)
+
+        playback_menu = tk.Menu(menu, **menu_style)
+        playback_menu.add_command(
+            label="Previous track",
+            command=self.previous_music
+        )
+        playback_menu.add_command(
+            label="Play / pause",
+            command=self.toggle_playback
+        )
+        playback_menu.add_command(
+            label="Stop",
+            command=self.stop_music
+        )
+        playback_menu.add_command(
+            label="Next track",
+            command=self.next_music
+        )
+        playback_menu.add_separator()
+        playback_menu.add_command(
+            label="Volume up",
+            command=lambda: self.adjust_volume(10)
+        )
+        playback_menu.add_command(
+            label="Volume down",
+            command=lambda: self.adjust_volume(-10)
+        )
+        menu.add_cascade(label="Playback", menu=playback_menu)
+
+        help_menu = tk.Menu(menu, **menu_style)
+        help_menu.add_command(label="Help", command=self.show_help)
+        help_menu.add_command(label="About MP3 Player", command=self.show_about)
+        menu.add_cascade(label="Help", menu=help_menu)
+        return menu
+
+    def adjust_volume(self, delta):
+        self.set_volume(self.volume_level + delta)
+        self.volume_scale.set(self.volume_level)
 
     def show_help(self):
         messagebox.showinfo(
