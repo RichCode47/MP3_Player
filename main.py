@@ -1,10 +1,15 @@
 import json
 import os
 import tkinter as tk
+import time
+from io import BytesIO
 from collections import Counter
 from tkinter import filedialog, messagebox, ttk
 
 import pygame
+from PIL import Image, ImageTk, UnidentifiedImageError
+from mutagen import MutagenError
+from mutagen.mp3 import MP3
 
 
 class MP3Player:
@@ -23,6 +28,14 @@ class MP3Player:
         self.current_song = None
         self.current_song_index = None
         self.paused = False
+        self.track_duration = None
+        self.cover_data = None
+        self.cover_image = None
+        self.cover_path = None
+        self.playback_position = 0.0
+        self.playback_started_at = None
+        self.seeking = False
+        self.progress_after_id = None
 
         try:
             pygame.mixer.init()
@@ -305,57 +318,149 @@ class MP3Player:
             wraplength=190
         ).grid(row=6, column=0, padx=18, pady=(0, 18), sticky="nw")
 
-        player_bar = tk.Frame(self.root, bg="#050505", height=88)
+        player_bar = tk.Frame(self.root, bg="#050505", height=100)
         player_bar.grid(row=2, column=0, sticky="ew")
         player_bar.grid_propagate(False)
         player_bar.columnconfigure(0, weight=1)
-        player_bar.columnconfigure(1, weight=0)
+        player_bar.columnconfigure(1, weight=2)
         player_bar.columnconfigure(2, weight=1)
 
         track_info = tk.Frame(player_bar, bg="#050505")
-        track_info.grid(row=0, column=0, padx=18, sticky="w")
-        self.bottom_track_title = tk.Label(
+        track_info.grid(row=0, column=0, padx=14, sticky="w")
+        self.cover_art = tk.Label(
             track_info,
-            text="No track selected",
+            text="♫",
+            font=("Segoe UI Symbol", 23),
+            bg="#263b35",
+            fg="#d9eee4",
+            width=3,
+            height=2
+        )
+        self.cover_art.pack(side=tk.LEFT, padx=(0, 10))
+        track_text = tk.Frame(track_info, bg="#050505", width=210)
+        track_text.pack(side=tk.LEFT, fill=tk.Y)
+        track_text.pack_propagate(False)
+        self.bottom_track_title = tk.Label(
+            track_text,
+            text="Nothing playing",
             font=("Arial", 10, "bold"),
             bg="#050505",
             fg="#ffffff",
-            anchor="w"
+            anchor="w",
+            wraplength=205
         )
-        self.bottom_track_title.pack(anchor="w")
+        self.bottom_track_title.pack(anchor="w", fill=tk.X, pady=(13, 0))
         self.bottom_track_location = tk.Label(
-            track_info,
+            track_text,
             text="Load a music folder to begin",
             font=("Arial", 9),
             bg="#050505",
             fg="#a7a7a7",
-            anchor="w"
+            anchor="w",
+            wraplength=205
         )
-        self.bottom_track_location.pack(anchor="w", pady=(3, 0))
+        self.bottom_track_location.pack(anchor="w", fill=tk.X, pady=(3, 0))
 
-        transport = tk.Frame(player_bar, bg="#050505")
-        transport.grid(row=0, column=1, pady=12)
-        for column, (label, command) in enumerate((
-            ("Previous", self.previous_music),
-            ("Play", self.play_music),
-            ("Pause", self.pause_music),
-            ("Stop", self.stop_music),
-            ("Next", self.next_music)
+        player_center = tk.Frame(player_bar, bg="#050505")
+        player_center.grid(row=0, column=1, pady=(8, 4), sticky="nsew")
+        player_center.columnconfigure(0, weight=1)
+        transport = tk.Frame(player_center, bg="#050505")
+        transport.grid(row=0, column=0, pady=(0, 3))
+        for column, (label, command, symbol) in enumerate((
+            ("Previous", self.previous_music, "|◀"),
+            ("Play or pause", self.toggle_playback, "▶"),
+            ("Stop", self.stop_music, "■"),
+            ("Next", self.next_music, "▶|")
         )):
             self._make_button(
                 transport,
-                label,
+                symbol,
                 command,
-                accent=(label == "Play")
-            ).grid(row=0, column=column, padx=4)
+                accent=(label == "Play or pause")
+            ).grid(row=0, column=column, padx=7)
+        self.playback_button = transport.grid_slaves(row=0, column=1)[0]
+        self.playback_button.configure(
+            font=("Segoe UI Symbol", 12, "bold"),
+            width=3,
+            height=1,
+            padx=2,
+            pady=5
+        )
 
-        tk.Label(
-            player_bar,
-            text="LOCAL PLAYBACK",
-            font=("Arial", 9, "bold"),
+        progress = tk.Frame(player_center, bg="#050505")
+        progress.grid(row=1, column=0, sticky="ew")
+        progress.columnconfigure(1, weight=1)
+        self.elapsed_label = tk.Label(
+            progress,
+            text="0:00",
+            font=("Arial", 8),
             bg="#050505",
-            fg="#777777"
-        ).grid(row=0, column=2, padx=18, sticky="e")
+            fg="#b3b3b3",
+            width=5
+        )
+        self.elapsed_label.grid(row=0, column=0, padx=(0, 5))
+        self.seek_var = tk.DoubleVar(value=0)
+        self.seek_scale = tk.Scale(
+            progress,
+            variable=self.seek_var,
+            from_=0,
+            to=1,
+            orient=tk.HORIZONTAL,
+            showvalue=False,
+            resolution=0.1,
+            command=self.on_seek_drag,
+            bg="#050505",
+            fg="#ffffff",
+            troughcolor="#535353",
+            activebackground="#1ed760",
+            highlightthickness=0,
+            bd=0,
+            sliderlength=10,
+            width=5,
+            state=tk.DISABLED
+        )
+        self.seek_scale.grid(row=0, column=1, sticky="ew")
+        self.seek_scale.bind("<ButtonPress-1>", self.begin_seek)
+        self.seek_scale.bind("<ButtonRelease-1>", self.seek_music)
+        self.duration_label = tk.Label(
+            progress,
+            text="--:--",
+            font=("Arial", 8),
+            bg="#050505",
+            fg="#b3b3b3",
+            width=5
+        )
+        self.duration_label.grid(row=0, column=2, padx=(5, 0))
+
+        volume_frame = tk.Frame(player_bar, bg="#050505")
+        volume_frame.grid(row=0, column=2, padx=16, sticky="e")
+        tk.Label(
+            volume_frame,
+            text="VOL",
+            font=("Arial", 8, "bold"),
+            bg="#050505",
+            fg="#a7a7a7"
+        ).pack(side=tk.LEFT, padx=(0, 7))
+        self.volume_scale = tk.Scale(
+            volume_frame,
+            from_=0,
+            to=100,
+            orient=tk.HORIZONTAL,
+            showvalue=False,
+            command=self.set_volume,
+            bg="#050505",
+            fg="#ffffff",
+            troughcolor="#535353",
+            activebackground="#1ed760",
+            highlightthickness=0,
+            bd=0,
+            sliderlength=10,
+            width=5,
+            length=100
+        )
+        self.volume_scale.set(100)
+        self.volume_scale.pack(side=tk.LEFT)
+        self.root.after(250, self.update_progress)
 
     @staticmethod
     def _make_button(parent, text, command, accent=False):
@@ -374,15 +479,146 @@ class MP3Player:
             cursor="hand2"
         )
 
+    @staticmethod
+    def format_time(seconds):
+        total_seconds = max(0, int(seconds))
+        minutes, remaining_seconds = divmod(total_seconds, 60)
+        return f"{minutes}:{remaining_seconds:02d}"
+
+    def read_track_metadata(self, path):
+        try:
+            audio = MP3(path)
+        except (MutagenError, OSError):
+            return None, None
+
+        duration = audio.info.length
+        cover_data = None
+        if audio.tags:
+            artwork = audio.tags.getall("APIC")
+            if artwork:
+                front_cover = next(
+                    (image for image in artwork if image.type == 3),
+                    artwork[0]
+                )
+                cover_data = front_cover.data
+        return (duration if duration > 0 else None), cover_data
+
+    def update_cover_art(self, path):
+        if path == self.cover_path:
+            return
+
+        self.cover_path = path
+        self.cover_image = None
+        if path and self.cover_data:
+            try:
+                with Image.open(BytesIO(self.cover_data)) as image:
+                    cover = image.convert("RGB")
+                    cover.thumbnail((58, 58), Image.Resampling.LANCZOS)
+                    self.cover_image = ImageTk.PhotoImage(cover)
+            except (UnidentifiedImageError, OSError):
+                self.cover_image = None
+
+        if self.cover_image:
+            self.cover_art.config(image=self.cover_image, text="")
+        else:
+            self.cover_art.config(image="", text="♫")
+
+    def current_position(self):
+        if (
+            self.playback_started_at is not None
+            and not self.paused
+        ):
+            position = self.playback_position + (
+                time.monotonic() - self.playback_started_at
+            )
+        else:
+            position = self.playback_position
+        if self.track_duration is not None:
+            position = min(position, self.track_duration)
+        return max(0.0, position)
+
+    def update_progress(self):
+        if self.current_song:
+            is_busy = pygame.mixer.music.get_busy()
+            if not self.paused and not is_busy:
+                self.playback_position = (
+                    self.track_duration
+                    if self.track_duration is not None
+                    else self.current_position()
+                )
+                self.playback_started_at = None
+                position = self.playback_position
+            else:
+                position = self.current_position()
+
+            if not self.seeking:
+                self.seek_var.set(position)
+            self.elapsed_label.config(
+                text=self.format_time(position)
+            )
+            self.playback_button.config(
+                text="Ⅱ" if is_busy and not self.paused else "▶"
+            )
+        self.progress_after_id = self.root.after(250, self.update_progress)
+
+    def begin_seek(self, _event=None):
+        self.seeking = True
+
+    def on_seek_drag(self, value):
+        self.elapsed_label.config(text=self.format_time(float(value)))
+
+    def seek_music(self, _event=None):
+        self.seeking = False
+        if self.track_duration is None or self.current_song is None:
+            return
+
+        position = min(float(self.seek_var.get()), self.track_duration)
+        try:
+            pygame.mixer.music.set_pos(position)
+        except pygame.error as error:
+            self.playback_position = self.current_position()
+            self.seek_var.set(self.playback_position)
+            self.elapsed_label.config(
+                text=self.format_time(self.playback_position)
+            )
+            messagebox.showerror(
+                "Seeking Error",
+                f"Could not seek within this track:\n{error}",
+                parent=self.root
+            )
+            return
+
+        self.playback_position = position
+        self.playback_started_at = (
+            None if self.paused else time.monotonic()
+        )
+
+    def set_volume(self, value):
+        pygame.mixer.music.set_volume(float(value) / 100)
+
+    def toggle_playback(self):
+        if self.current_song:
+            if self.paused:
+                self.resume_music()
+            elif pygame.mixer.music.get_busy():
+                self.pause_music()
+            elif self.current_song_index is not None:
+                self.play_song_index(self.current_song_index)
+        else:
+            self.play_music()
+
     def update_track_display(self):
         if self.current_song:
             title = os.path.basename(self.current_song)
             location = os.path.dirname(self.current_song)
+            self.update_cover_art(self.current_song)
             self.now_playing_title.config(text=title)
             self.now_playing_location.config(text=location)
             self.bottom_track_title.config(text=title)
             self.bottom_track_location.config(text=location)
+            self.playback_button.config(text="Ⅱ" if not self.paused else "▶")
         else:
+            self.update_cover_art(None)
             self.now_playing_title.config(text="Nothing playing")
             self.now_playing_location.config(
                 text="Choose a track from your library."
@@ -391,6 +627,21 @@ class MP3Player:
             self.bottom_track_location.config(
                 text="Load a music folder to begin"
             )
+            self.playback_button.config(text="▶")
+
+        if self.track_duration is not None:
+            self.seek_scale.configure(
+                to=max(self.track_duration, 0.1),
+                state=tk.NORMAL
+            )
+            self.duration_label.config(
+                text=self.format_time(self.track_duration)
+            )
+        else:
+            self.seek_scale.configure(to=1, state=tk.DISABLED)
+            self.duration_label.config(text="--:--")
+        self.seek_var.set(self.playback_position)
+        self.elapsed_label.config(text=self.format_time(self.playback_position))
 
         self.library_count.config(
             text=f"{len(self.songs)} track"
@@ -735,21 +986,38 @@ class MP3Player:
 
     def play_song_index(self, song_index):
         song = self.songs[song_index]
+        duration, cover_data = self.read_track_metadata(song)
 
         try:
             pygame.mixer.music.stop()
             self.current_song = None
             self.current_song_index = None
             self.paused = False
+            self.playback_position = 0.0
+            self.playback_started_at = None
 
             pygame.mixer.music.load(song)
             pygame.mixer.music.play()
 
             self.current_song = song
             self.current_song_index = song_index
+            self.track_duration = duration
+            self.cover_data = cover_data
+            self.playback_started_at = time.monotonic()
             self.update_track_display()
-            self.status.set(f"Playing: {os.path.basename(song)}")
+            status = f"Playing: {os.path.basename(song)}"
+            if duration is None:
+                status += " (duration unavailable; seeking disabled)"
+            self.status.set(status)
         except (pygame.error, OSError) as error:
+            self.current_song = None
+            self.current_song_index = None
+            self.track_duration = None
+            self.cover_data = None
+            self.playback_position = 0.0
+            self.playback_started_at = None
+            self.paused = False
+            self.update_track_display()
             self.status.set("Playback failed.")
             messagebox.showerror(
                 "Playback Error",
@@ -787,8 +1055,10 @@ class MP3Player:
     def pause_music(self):
         if self.current_song and not self.paused:
             if pygame.mixer.music.get_busy():
+                self.playback_position = self.current_position()
                 pygame.mixer.music.pause()
                 self.paused = True
+                self.playback_started_at = None
                 self.update_track_display()
                 self.status.set(
                     f"Paused: {os.path.basename(self.current_song)}"
@@ -798,6 +1068,7 @@ class MP3Player:
         if self.current_song and self.paused:
             pygame.mixer.music.unpause()
             self.paused = False
+            self.playback_started_at = time.monotonic()
             self.update_track_display()
             self.status.set(
                 f"Playing: {os.path.basename(self.current_song)}"
@@ -808,10 +1079,16 @@ class MP3Player:
         self.current_song = None
         self.current_song_index = None
         self.paused = False
+        self.track_duration = None
+        self.cover_data = None
+        self.playback_position = 0.0
+        self.playback_started_at = None
         self.update_track_display()
         self.status.set("Stopped.")
 
     def close_app(self):
+        if self.progress_after_id is not None:
+            self.root.after_cancel(self.progress_after_id)
         pygame.mixer.quit()
         self.root.destroy()
 
