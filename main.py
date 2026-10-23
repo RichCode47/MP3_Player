@@ -29,6 +29,11 @@ class MP3Player:
         self.folder_order = []
         self.displayed_song_indices = []
         self.displayed_songs = []
+        self.library_category = tk.StringVar(value="Tracks")
+        self.library_items = []
+        self.library_folder_filter = None
+        self.library_expanded = False
+        self.current_playlist_name = "Current playlist"
         self.sort_order = "name_asc"
         self.current_song = None
         self.current_song_index = None
@@ -283,47 +288,110 @@ class MP3Player:
         workspace = tk.Frame(self.root, bg="#000000")
         workspace.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 8))
         workspace.rowconfigure(0, weight=1)
-        workspace.columnconfigure(0, minsize=220, weight=0)
+        workspace.columnconfigure(0, minsize=260, weight=0)
         workspace.columnconfigure(1, weight=1)
         workspace.columnconfigure(2, minsize=225, weight=0)
+        self.workspace = workspace
 
         library = tk.Frame(workspace, bg="#121212")
         library.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
         library.columnconfigure(0, weight=1)
-        library.rowconfigure(5, weight=1)
+        library.rowconfigure(3, weight=1)
 
+        library_header = tk.Frame(library, bg="#121212")
+        library_header.grid(
+            row=0, column=0, padx=16, pady=(17, 12), sticky="ew"
+        )
+        library_header.columnconfigure(0, weight=1)
         tk.Label(
-            library,
+            library_header,
             text="Your Library",
             font=("Arial", 15, "bold"),
             bg="#121212",
             fg="#ffffff"
-        ).grid(row=0, column=0, padx=18, pady=(20, 15), sticky="w")
-
-        self._make_button(
-            library, "Load music folder", self.load_music, accent=True
-        ).grid(row=1, column=0, padx=14, pady=4, sticky="ew")
-        self._make_button(
-            library, "Open saved playlist", self.open_playlist
-        ).grid(row=2, column=0, padx=14, pady=4, sticky="ew")
-        self._make_button(
-            library, "Save current playlist", self.save_playlist
-        ).grid(row=3, column=0, padx=14, pady=4, sticky="ew")
-
-        tk.Frame(library, bg="#282828", height=1).grid(
-            row=4, column=0, padx=14, pady=15, sticky="ew"
+        ).grid(row=0, column=0, sticky="w")
+        add_button = self._make_button(
+            library_header, "+", self.load_music
         )
-        self.library_summary = tk.Label(
-            library,
-            text="LOCAL FILES\n\nLoad a folder of MP3 files to\nbuild your library.",
-            justify=tk.LEFT,
-            font=("Arial", 10),
+        add_button.configure(font=("Arial", 18), width=2, padx=3, pady=1)
+        add_button.grid(row=0, column=1, padx=(8, 2))
+        expand_button = self._make_button(
+            library_header, "↗", self.toggle_library_expansion
+        )
+        expand_button.configure(font=("Arial", 12), width=2, padx=3, pady=5)
+        expand_button.grid(row=0, column=2, padx=(2, 0))
+        self.library_expand_button = expand_button
+
+        category_bar = tk.Frame(library, bg="#121212")
+        category_bar.grid(
+            row=1, column=0, padx=10, pady=(0, 9), sticky="ew"
+        )
+        self.library_category_buttons = {}
+        for category in ("Tracks", "Folders", "Playlists"):
+            button = tk.Button(
+                category_bar,
+                text=category,
+                command=lambda value=category: self.set_library_category(
+                    value
+                ),
+                bg="#292929",
+                fg="#ffffff",
+                activebackground="#3a3a3a",
+                activeforeground="#ffffff",
+                font=("Arial", 9, "bold"),
+                relief=tk.FLAT,
+                padx=8,
+                pady=7,
+                cursor="hand2"
+            )
+            button.pack(side=tk.LEFT, padx=2)
+            self.library_category_buttons[category] = button
+
+        library_actions = tk.Frame(library, bg="#121212")
+        library_actions.grid(
+            row=2, column=0, padx=12, pady=(0, 8), sticky="ew"
+        )
+        library_actions.columnconfigure(0, weight=1)
+        library_actions.columnconfigure(1, weight=1)
+        self._make_button(
+            library_actions, "Open playlist", self.open_playlist
+        ).grid(row=0, column=0, padx=2, sticky="ew")
+        self._make_button(
+            library_actions, "Save playlist", self.save_playlist
+        ).grid(row=0, column=1, padx=2, sticky="ew")
+
+        library_list_frame = tk.Frame(library, bg="#121212")
+        library_list_frame.grid(
+            row=3, column=0, padx=(12, 6), pady=(0, 8), sticky="nsew"
+        )
+        library_list_frame.rowconfigure(0, weight=1)
+        library_list_frame.columnconfigure(0, weight=1)
+        self.library_list = tk.Listbox(
+            library_list_frame,
             bg="#121212",
-            fg="#b3b3b3",
-            wraplength=180
+            fg="#eeeeee",
+            selectbackground="#292929",
+            selectforeground="#ffffff",
+            exportselection=False,
+            activestyle="none",
+            font=("Arial", 10),
+            relief=tk.FLAT,
+            highlightthickness=0
         )
-        self.library_summary.grid(
-            row=5, column=0, padx=18, pady=5, sticky="nw"
+        self.library_list.grid(row=0, column=0, sticky="nsew")
+        library_scrollbar = tk.Scrollbar(
+            library_list_frame,
+            command=self.library_list.yview
+        )
+        library_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.library_list.configure(yscrollcommand=library_scrollbar.set)
+        self.library_list.bind(
+            "<<ListboxSelect>>",
+            self.select_library_item
+        )
+        self.library_list.bind(
+            "<Double-Button-1>",
+            self.activate_library_item
         )
         self.library_count = tk.Label(
             library,
@@ -333,7 +401,7 @@ class MP3Player:
             fg="#777777"
         )
         self.library_count.grid(
-            row=6, column=0, padx=18, pady=(0, 18), sticky="w"
+            row=4, column=0, padx=16, pady=(0, 14), sticky="w"
         )
 
         center = tk.Frame(workspace, bg="#151515")
@@ -645,6 +713,144 @@ class MP3Player:
             pady=8,
             cursor="hand2"
         )
+
+    def set_library_category(self, category):
+        if category not in self.library_category_buttons:
+            return
+        self.library_category.set(category)
+        if category in ("Tracks", "Playlists"):
+            self.library_folder_filter = None
+            self.set_search_query("")
+        self.refresh_library()
+        self.refresh_playlist()
+
+    def toggle_library_expansion(self):
+        self.library_expanded = not self.library_expanded
+        self.workspace.columnconfigure(
+            0,
+            minsize=340 if self.library_expanded else 260
+        )
+        self.library_expand_button.configure(
+            text="↙" if self.library_expanded else "↗"
+        )
+
+    def refresh_library(self):
+        category = self.library_category.get()
+        selected_item = None
+        selected_rows = self.library_list.curselection()
+        if selected_rows and selected_rows[0] < len(self.library_items):
+            selected_item = self.library_items[selected_rows[0]]
+        for name, button in self.library_category_buttons.items():
+            is_selected = name == category
+            button.configure(
+                bg="#ffffff" if is_selected else "#292929",
+                fg="#111111" if is_selected else "#ffffff",
+                activebackground="#dddddd" if is_selected else "#3a3a3a",
+                activeforeground="#111111" if is_selected else "#ffffff"
+            )
+
+        self.library_items = []
+        self.library_list.delete(0, tk.END)
+        if category == "Tracks":
+            for index, song in enumerate(self.songs):
+                folder = os.path.basename(os.path.dirname(song)) or song
+                self.library_items.append(("track", index))
+                self.library_list.insert(
+                    tk.END,
+                    f"♪  {os.path.basename(song)}  ·  {folder}"
+                )
+                if selected_item == ("track", index):
+                    selected_row = len(self.library_items) - 1
+                    self.library_list.selection_set(selected_row)
+            if not self.songs:
+                self.library_list.insert(tk.END, "Load a folder to see tracks.")
+        elif category == "Folders":
+            folder_counts = Counter(os.path.dirname(song) for song in self.songs)
+            for folder, count in sorted(
+                folder_counts.items(),
+                key=lambda item: item[0].casefold()
+            ):
+                self.library_items.append(("folder", folder))
+                name = os.path.basename(folder) or folder
+                self.library_list.insert(
+                    tk.END,
+                    f"▸  {name}  ·  {count} track"
+                    f"{'s' if count != 1 else ''}"
+                )
+                if selected_item == ("folder", folder):
+                    selected_row = len(self.library_items) - 1
+                    self.library_list.selection_set(selected_row)
+            if not self.library_items:
+                self.library_list.insert(tk.END, "No folders in your library.")
+        else:
+            if self.songs:
+                self.library_items.append(("playlist", self.current_playlist_name))
+                self.library_list.insert(
+                    tk.END,
+                    f"♫  {self.current_playlist_name}  ·  "
+                    f"{len(self.songs)} track"
+                    f"{'s' if len(self.songs) != 1 else ''}"
+                )
+                if selected_item == ("playlist", self.current_playlist_name):
+                    self.library_list.selection_set(0)
+            else:
+                self.library_list.insert(
+                    tk.END,
+                    "Open or load a playlist to see it here."
+                )
+
+        self.library_count.config(
+            text=f"{len(self.songs)} track"
+            f"{'s' if len(self.songs) != 1 else ''}"
+        )
+        if self.library_folder_filter is not None:
+            self.library_count.config(
+                text=f"{self.library_count.cget('text')} · folder filtered"
+            )
+
+    def select_library_item(self, _event=None):
+        selection = self.library_list.curselection()
+        if not selection or selection[0] >= len(self.library_items):
+            return
+
+        item_type, value = self.library_items[selection[0]]
+        if item_type == "track":
+            self.library_folder_filter = None
+            self.set_search_query("")
+            self.refresh_playlist(preferred_index=value)
+            if value in self.displayed_song_indices:
+                row = self.displayed_song_indices.index(value)
+                self.playlist.selection_clear(0, tk.END)
+                self.playlist.selection_set(row)
+                self.playlist.activate(row)
+                self.playlist.see(row)
+        elif item_type == "folder":
+            self.library_folder_filter = value
+            self.refresh_playlist()
+            self.status.set(f"Showing tracks from {os.path.basename(value)}.")
+            self.library_count.config(
+                text=f"{len(self.displayed_song_indices)} track"
+                f"{'s' if len(self.displayed_song_indices) != 1 else ''}"
+                " in folder"
+            )
+        elif item_type == "playlist":
+            self.library_folder_filter = None
+            self.refresh_playlist()
+
+    def activate_library_item(self, _event=None):
+        selection = self.library_list.curselection()
+        if not selection or selection[0] >= len(self.library_items):
+            return
+
+        item_type, value = self.library_items[selection[0]]
+        if item_type == "track":
+            self.play_song_index(value)
+        elif item_type == "folder":
+            self.set_library_category("Tracks")
+            self.library_folder_filter = value
+            self.refresh_playlist()
+        elif item_type == "playlist":
+            self.set_library_category("Tracks")
 
     def configure_custom_title_bar(self):
         if sys.platform != "win32":
@@ -978,24 +1184,7 @@ class MP3Player:
         self.seek_var.set(self.playback_position)
         self.elapsed_label.config(text=self.format_time(self.playback_position))
 
-        self.library_count.config(
-            text=f"{len(self.songs)} track"
-            f"{'s' if len(self.songs) != 1 else ''}"
-        )
-        if self.songs:
-            folders = {os.path.dirname(song) for song in self.songs}
-            folder_label = (
-                next(iter(folders))
-                if len(folders) == 1
-                else f"{len(folders)} folders"
-            )
-            self.library_summary.config(
-                text=f"LOCAL FILES\n\n{folder_label}"
-            )
-        else:
-            self.library_summary.config(
-                text="LOCAL FILES\n\nLoad a folder of MP3 files to\nbuild your library."
-            )
+        self.refresh_library()
 
     def load_music(self):
         directory = filedialog.askdirectory(parent=self.root)
@@ -1023,9 +1212,14 @@ class MP3Player:
         self.stop_music()
         self.songs = songs.copy()
         self.folder_order = songs.copy()
+        self.current_playlist_name = os.path.basename(
+            os.path.normpath(directory)
+        )
+        self.library_folder_filter = None
         self.displayed_song_indices = []
         self.displayed_songs = []
         self.playlist.delete(0, tk.END)
+        self.set_library_category("Tracks")
         self.sort_order = "name_asc"
         self.sort_var.set("Name (A-Z)")
         self.set_search_query("")
@@ -1136,9 +1330,19 @@ class MP3Player:
             if self.search_placeholder_visible
             else self.search_var.get().strip().casefold()
         )
+        folder_filter = (
+            os.path.normcase(os.path.abspath(self.library_folder_filter))
+            if self.library_folder_filter is not None
+            else None
+        )
         self.displayed_song_indices = [
             index for index, song in enumerate(self.songs)
             if query in os.path.basename(song).casefold()
+            and (
+                folder_filter is None
+                or os.path.normcase(os.path.abspath(os.path.dirname(song)))
+                == folder_filter
+            )
         ]
         self.displayed_songs = [
             self.songs[index] for index in self.displayed_song_indices
@@ -1208,6 +1412,10 @@ class MP3Player:
             )
             return
 
+        self.current_playlist_name = os.path.splitext(
+            os.path.basename(path)
+        )[0]
+        self.refresh_library()
         self.status.set(f"Saved playlist: {os.path.basename(path)}")
 
     def open_playlist(self):
@@ -1246,6 +1454,11 @@ class MP3Player:
         self.displayed_song_indices = []
         self.displayed_songs = []
         self.playlist.delete(0, tk.END)
+        self.current_playlist_name = os.path.splitext(
+            os.path.basename(path)
+        )[0]
+        self.library_folder_filter = None
+        self.set_library_category("Tracks")
         self.sort_order = sort_order
         self.sort_var.set({
             "name_asc": "Name (A-Z)",
