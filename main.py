@@ -1,11 +1,14 @@
 import ctypes
 import json
+import math
 import os
 import sys
+import tempfile
 import tkinter as tk
 import time
 from io import BytesIO
 from collections import Counter
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import pygame
@@ -30,7 +33,9 @@ class MP3Player:
         self.current_song = None
         self.current_song_index = None
         self.paused = False
-        self.volume_level = 100.0
+        self.settings_path = self.get_settings_path()
+        self.volume_save_after_id = None
+        self.volume_level = self.load_volume_setting()
         self.track_duration = None
         self.cover_data = None
         self.cover_image = None
@@ -43,6 +48,7 @@ class MP3Player:
 
         try:
             pygame.mixer.init()
+            pygame.mixer.music.set_volume(self.volume_level / 100)
         except pygame.error as error:
             messagebox.showerror(
                 "Audio Error",
@@ -55,6 +61,84 @@ class MP3Player:
         self.build_interface()
         self.configure_custom_title_bar()
         self.root.protocol("WM_DELETE_WINDOW", self.close_app)
+
+    @staticmethod
+    def get_settings_path():
+        if sys.platform == "win32":
+            config_directory = Path(
+                os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")
+            )
+        elif sys.platform == "darwin":
+            config_directory = Path.home() / "Library" / "Application Support"
+        else:
+            config_directory = Path(
+                os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+            )
+        return config_directory / "MP3_Player" / "settings.json"
+
+    def load_volume_setting(self):
+        try:
+            with self.settings_path.open("r", encoding="utf-8") as settings_file:
+                settings = json.load(settings_file)
+        except FileNotFoundError:
+            return 100.0
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            messagebox.showwarning(
+                "Volume Settings",
+                f"Could not read saved volume settings; using 100% volume.\n"
+                f"{error}",
+                parent=self.root
+            )
+            return 100.0
+
+        volume = settings.get("volume") if isinstance(settings, dict) else None
+        if (
+            isinstance(volume, bool)
+            or not isinstance(volume, (int, float))
+            or not 0 <= volume <= 100
+            or not math.isfinite(volume)
+        ):
+            messagebox.showwarning(
+                "Volume Settings",
+                "Saved volume setting is invalid; using 100% volume.",
+                parent=self.root
+            )
+            return 100.0
+        return float(volume)
+
+    def save_volume_setting(self):
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        file_descriptor, temporary_path = tempfile.mkstemp(
+            prefix="settings-",
+            suffix=".tmp",
+            dir=self.settings_path.parent
+        )
+        try:
+            with os.fdopen(file_descriptor, "w", encoding="utf-8") as settings_file:
+                json.dump({"volume": self.volume_level}, settings_file)
+                settings_file.write("\n")
+                settings_file.flush()
+                os.fsync(settings_file.fileno())
+            os.replace(temporary_path, self.settings_path)
+        except OSError:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+            raise
+
+    def schedule_volume_save(self):
+        if self.volume_save_after_id is not None:
+            self.root.after_cancel(self.volume_save_after_id)
+        self.volume_save_after_id = self.root.after(
+            350,
+            self.persist_volume_setting
+        )
+
+    def persist_volume_setting(self):
+        self.volume_save_after_id = None
+        try:
+            self.save_volume_setting()
+        except OSError as error:
+            self.status.set(f"Volume changed but could not be saved: {error}")
 
     def build_interface(self):
         style = ttk.Style(self.root)
@@ -837,8 +921,15 @@ class MP3Player:
         return "break"
 
     def set_volume(self, value):
-        self.volume_level = max(0.0, min(100.0, float(value)))
-        pygame.mixer.music.set_volume(self.volume_level / 100)
+        volume_level = max(0.0, min(100.0, float(value)))
+        try:
+            pygame.mixer.music.set_volume(volume_level / 100)
+        except pygame.error as error:
+            self.status.set(f"Could not change playback volume: {error}")
+            return
+
+        self.volume_level = volume_level
+        self.schedule_volume_save()
 
     def toggle_playback(self):
         if self.current_song:
@@ -1340,6 +1431,17 @@ class MP3Player:
     def close_app(self):
         if self.progress_after_id is not None:
             self.root.after_cancel(self.progress_after_id)
+        if self.volume_save_after_id is not None:
+            self.root.after_cancel(self.volume_save_after_id)
+            self.volume_save_after_id = None
+            try:
+                self.save_volume_setting()
+            except OSError as error:
+                messagebox.showwarning(
+                    "Volume Settings",
+                    f"Could not save volume settings:\n{error}",
+                    parent=self.root
+                )
         pygame.mixer.quit()
         self.root.destroy()
 
