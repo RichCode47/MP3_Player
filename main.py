@@ -30,6 +30,7 @@ class MP3Player:
         self.current_song = None
         self.current_song_index = None
         self.paused = False
+        self.volume_level = 100.0
         self.track_duration = None
         self.cover_data = None
         self.cover_image = None
@@ -540,6 +541,8 @@ class MP3Player:
         )
         self.volume_scale.set(100)
         self.volume_scale.pack(side=tk.LEFT)
+        self.volume_scale.bind("<ButtonPress-1>", self.on_volume_pointer)
+        self.volume_scale.bind("<B1-Motion>", self.on_volume_pointer)
         self.root.after(250, self.update_progress)
 
     @staticmethod
@@ -821,8 +824,21 @@ class MP3Player:
             None if self.paused else time.monotonic()
         )
 
+    def on_volume_pointer(self, event):
+        minimum_x = self.volume_scale.coords(0)[0]
+        maximum_x = self.volume_scale.coords(100)[0]
+        if maximum_x <= minimum_x:
+            return "break"
+
+        fraction = (event.x - minimum_x) / (maximum_x - minimum_x)
+        self.volume_level = max(0.0, min(100.0, fraction * 100))
+        self.volume_scale.set(self.volume_level)
+        self.set_volume(self.volume_level)
+        return "break"
+
     def set_volume(self, value):
-        pygame.mixer.music.set_volume(float(value) / 100)
+        self.volume_level = max(0.0, min(100.0, float(value)))
+        pygame.mixer.music.set_volume(self.volume_level / 100)
 
     def toggle_playback(self):
         if self.current_song:
@@ -1231,6 +1247,7 @@ class MP3Player:
             self.playback_started_at = None
 
             pygame.mixer.music.load(song)
+            pygame.mixer.music.set_volume(self.volume_level / 100)
             pygame.mixer.music.play()
 
             self.current_song = song
