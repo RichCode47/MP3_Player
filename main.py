@@ -3,29 +3,40 @@ import json
 import math
 import os
 import sys
-import tempfile
 import tkinter as tk
-import time
-from io import BytesIO
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import pygame
-from PIL import Image, ImageTk, UnidentifiedImageError
-from mutagen import MutagenError
-from mutagen.mp3 import MP3
+from PIL import Image, ImageTk
+
+from library import read_track_metadata, scan_music_folder, track_ids
+from persistence import read_playlist, validate_playlist, write_json_atomic
+from playback import PlaybackEngine, PlaybackState
+from playlist_queue import PlaylistQueue, RepeatMode
 
 
 class MP3Player:
     def __init__(self, root):
         self.root = root
+        self.ready = False
+        self.closing = False
+        self.app_menu = None
+        self.executor = None
+        self.background_jobs = {}
+        self.background_after_id = None
+        self.pending_track_id = None
+        self.playback = PlaybackEngine()
         self.root.title("MP3 Player")
         self.root.geometry("1180x740")
         self.root.minsize(900, 600)
         self.root.configure(bg="#000000")
 
         self.songs = []
+        self.song_ids = []
+        self.song_index_by_id = {}
         self.folder_order = []
         self.displayed_song_indices = []
         self.displayed_songs = []
@@ -37,35 +48,141 @@ class MP3Player:
         self.sort_order = "name_asc"
         self.current_song = None
         self.current_song_index = None
-        self.paused = False
+        self.playlist_queue = PlaylistQueue()
         self.settings_path = self.get_settings_path()
         self.volume_save_after_id = None
         self.volume_level = self.load_volume_setting()
-        self.track_duration = None
-        self.cover_data = None
+        self.cover_thumbnail = None
         self.cover_image = None
-        self.cover_path = None
-        self.playback_position = 0.0
-        self.playback_started_at = None
+        self.large_cover_image = None
         self.seeking = False
         self.progress_after_id = None
         self.search_placeholder_visible = False
 
         try:
-            pygame.mixer.init()
-            pygame.mixer.music.set_volume(self.volume_level / 100)
+            self.playback.initialize(self.volume_level)
         except pygame.error as error:
             messagebox.showerror(
                 "Audio Error",
                 f"Could not initialize the audio device:\n{error}",
                 parent=self.root
             )
+            self.playback.shutdown()
             self.root.destroy()
             return
 
+        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mp3-files")
         self.build_interface()
-        self.configure_custom_title_bar()
+        self.refresh_library()
+        try:
+            self.configure_custom_title_bar()
+        except OSError as error:
+            self.window_controls.grid_remove()
+            self.status.set(f"Using the system title bar: {error}")
         self.root.protocol("WM_DELETE_WINDOW", self.close_app)
+        self.background_after_id = self.root.after(50, self.process_background_tasks)
+        self.ready = True
+
+    @property
+    def paused(self):
+        return self.playback.state == PlaybackState.PAUSED
+
+    @property
+    def track_duration(self):
+        return self.playback.duration
+
+    def cancel_file_job(self, kind):
+        job = self.background_jobs.pop(kind, None)
+        if job is not None:
+            job[0].cancel()
+
+    def submit_file_job(self, kind, operation, callback, description):
+        self.cancel_file_job(kind)
+        future = self.executor.submit(operation)
+        self.background_jobs[kind] = (future, callback, description)
+
+    def process_background_tasks(self):
+        self.background_after_id = None
+        if self.closing:
+            return
+        for kind, (future, callback, description) in list(self.background_jobs.items()):
+            current = self.background_jobs.get(kind)
+            if current is None or current[0] is not future:
+                continue
+            if not future.done():
+                continue
+            self.background_jobs.pop(kind)
+            try:
+                result = future.result()
+            except Exception as error:
+                # Worker failures are reported on Tk's thread, never in a worker.
+                if kind == "track":
+                    self.pending_track_id = None
+                self.status.set(f"Could not {description}: {error}")
+                messagebox.showerror("File Error", f"Could not {description}:\n{error}", parent=self.root)
+            else:
+                callback(result)
+        self.background_after_id = self.root.after(50, self.process_background_tasks)
+
+    def install_library(self, songs, folder_order, sort_order, name):
+        self.stop_music()
+        self.songs = list(songs)
+        self.folder_order = list(folder_order)
+        self.current_playlist_name = name
+        self.library_folder_filter = None
+        self.displayed_song_indices = []
+        self.displayed_songs = []
+        self.playlist.delete(0, tk.END)
+        self.library_category.set("Tracks")
+        self.sort_order = sort_order
+        self.sort_var.set({
+            "name_asc": "Name (A-Z)", "name_desc": "Name (Z-A)", "folder": "Folder order"
+        }[sort_order])
+        self.set_search_query("")
+        self.apply_sort_order()
+        self.playlist_queue.set_tracks(self.song_ids)
+        if self.songs:
+            self.playlist.selection_set(0)
+            self.playlist.activate(0)
+            self.status.set(f"Loaded {len(self.songs)} MP3 file(s).")
+        else:
+            self.status.set("No available music files found.")
+
+    def playlist_loaded(self, path, result):
+        songs, order, sort, missing = result
+        self.install_library(songs, order, sort, Path(path).stem)
+        if missing:
+            preview = "\n".join(os.path.basename(song) for song in missing[:5])
+            remainder = f"\n...and {len(missing) - 5} more." if len(missing) > 5 else ""
+            messagebox.showwarning(
+                "Missing Music Files",
+                f"{len(missing)} file(s) could not be found and were skipped:\n{preview}{remainder}",
+                parent=self.root
+            )
+
+    def play_prepared_track(self, identity, metadata):
+        index = self.song_index_by_id.get(identity)
+        if identity != self.pending_track_id or index is None:
+            return
+        self.pending_track_id = None
+        self.playlist_queue.select(identity)
+        song = self.songs[index]
+        try:
+            self.playback.play(song, metadata.duration, self.volume_level)
+        except (pygame.error, OSError) as error:
+            self.status.set("Playback failed.")
+            messagebox.showerror("Playback Error", f"Could not play this file:\n{error}", parent=self.root)
+            self.update_track_display()
+            return
+        self.current_song = song
+        self.current_song_index = index
+        self.cover_thumbnail = metadata.artwork
+        self.refresh_playlist(preferred_index=index)
+        self.update_track_display()
+        status = f"Playing: {os.path.basename(song)}"
+        if metadata.duration is None:
+            status += " (duration unavailable; seeking disabled)"
+        self.status.set(status)
 
     @staticmethod
     def get_settings_path():
@@ -112,23 +229,7 @@ class MP3Player:
         return float(volume)
 
     def save_volume_setting(self):
-        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
-        file_descriptor, temporary_path = tempfile.mkstemp(
-            prefix="settings-",
-            suffix=".tmp",
-            dir=self.settings_path.parent
-        )
-        try:
-            with os.fdopen(file_descriptor, "w", encoding="utf-8") as settings_file:
-                json.dump({"volume": self.volume_level}, settings_file)
-                settings_file.write("\n")
-                settings_file.flush()
-                os.fsync(settings_file.fileno())
-            os.replace(temporary_path, self.settings_path)
-        except OSError:
-            if os.path.exists(temporary_path):
-                os.unlink(temporary_path)
-            raise
+        write_json_atomic(self.settings_path, {"volume": self.volume_level})
 
     def schedule_volume_save(self):
         if self.volume_save_after_id is not None:
@@ -166,6 +267,8 @@ class MP3Player:
         self.root.rowconfigure(1, weight=1)
         self.root.columnconfigure(0, weight=1)
         self.status = tk.StringVar(value="Load a folder to get started.")
+        self.shuffle_var = tk.BooleanVar(value=self.playlist_queue.shuffle)
+        self.repeat_var = tk.StringVar(value=self.playlist_queue.repeat_mode.value)
 
         top_bar = tk.Frame(self.root, bg="#050505", height=58)
         top_bar.grid(row=0, column=0, sticky="ew")
@@ -493,7 +596,7 @@ class MP3Player:
             fg="#ffffff"
         ).grid(row=0, column=0, padx=18, pady=(20, 18), sticky="w")
 
-        self.cover_art = tk.Label(
+        self.large_cover_art = tk.Label(
             activity,
             text="MP3",
             font=("Arial", 28, "bold"),
@@ -502,7 +605,7 @@ class MP3Player:
             width=8,
             height=5
         )
-        self.cover_art.grid(row=1, column=0, padx=18, pady=(0, 17), sticky="ew")
+        self.large_cover_art.grid(row=1, column=0, padx=18, pady=(0, 17), sticky="ew")
 
         self.now_playing_title = tk.Label(
             activity,
@@ -599,19 +702,23 @@ class MP3Player:
         player_center.columnconfigure(0, weight=1)
         transport = tk.Frame(player_center, bg="#050505")
         transport.grid(row=0, column=0, pady=(0, 3))
+        self.shuffle_button = self._make_button(
+            transport, "SH", self.toggle_shuffle
+        )
+        self.shuffle_button.grid(row=0, column=0, padx=5)
         for column, (label, command, symbol) in enumerate((
             ("Previous", self.previous_music, "|◀"),
             ("Play or pause", self.toggle_playback, "▶"),
             ("Stop", self.stop_music, "■"),
             ("Next", self.next_music, "▶|")
-        )):
+        ), start=1):
             self._make_button(
                 transport,
                 symbol,
                 command,
                 accent=(label == "Play or pause")
             ).grid(row=0, column=column, padx=7)
-        self.playback_button = transport.grid_slaves(row=0, column=1)[0]
+        self.playback_button = transport.grid_slaves(row=0, column=2)[0]
         self.playback_button.configure(
             font=("Segoe UI Symbol", 12, "bold"),
             width=3,
@@ -619,6 +726,11 @@ class MP3Player:
             padx=2,
             pady=5
         )
+        self.repeat_button = self._make_button(
+            transport, "RPT", self.cycle_repeat_mode
+        )
+        self.repeat_button.grid(row=0, column=5, padx=5)
+        self.update_playback_mode_controls()
 
         progress = tk.Frame(player_center, bg="#050505")
         progress.grid(row=1, column=0, sticky="ew")
@@ -655,6 +767,8 @@ class MP3Player:
         self.seek_scale.grid(row=0, column=1, sticky="ew")
         self.seek_scale.bind("<ButtonPress-1>", self.begin_seek)
         self.seek_scale.bind("<ButtonRelease-1>", self.seek_music)
+        for key in ("Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next"):
+            self.seek_scale.bind(f"<KeyPress-{key}>", self.seek_with_keyboard)
         self.duration_label = tk.Label(
             progress,
             text="--:--",
@@ -691,11 +805,11 @@ class MP3Player:
             width=5,
             length=100
         )
-        self.volume_scale.set(100)
+        self.volume_scale.set(self.volume_level)
         self.volume_scale.pack(side=tk.LEFT)
         self.volume_scale.bind("<ButtonPress-1>", self.on_volume_pointer)
         self.volume_scale.bind("<B1-Motion>", self.on_volume_pointer)
-        self.root.after(250, self.update_progress)
+        self.progress_after_id = self.root.after(250, self.update_progress)
 
     @staticmethod
     def _make_button(parent, text, command, accent=False):
@@ -736,90 +850,64 @@ class MP3Player:
 
     def refresh_library(self):
         category = self.library_category.get()
-        selected_item = None
-        selected_rows = self.library_list.curselection()
-        if selected_rows and selected_rows[0] < len(self.library_items):
-            selected_item = self.library_items[selected_rows[0]]
+        selection = self.library_list.curselection()
+        selected = (
+            self.library_items[selection[0]]
+            if selection and selection[0] < len(self.library_items) else None
+        )
         for name, button in self.library_category_buttons.items():
-            is_selected = name == category
+            active = name == category
             button.configure(
-                bg="#ffffff" if is_selected else "#292929",
-                fg="#111111" if is_selected else "#ffffff",
-                activebackground="#dddddd" if is_selected else "#3a3a3a",
-                activeforeground="#111111" if is_selected else "#ffffff"
+                bg="#ffffff" if active else "#292929",
+                fg="#111111" if active else "#ffffff",
+                activebackground="#dddddd" if active else "#3a3a3a",
+                activeforeground="#111111" if active else "#ffffff"
             )
-
-        self.library_items = []
-        self.library_list.delete(0, tk.END)
+        items, labels = [], []
         if category == "Tracks":
-            for index, song in enumerate(self.songs):
+            for identity, song in zip(self.song_ids, self.songs):
                 folder = os.path.basename(os.path.dirname(song)) or song
-                self.library_items.append(("track", index))
-                self.library_list.insert(
-                    tk.END,
-                    f"♪  {os.path.basename(song)}  ·  {folder}"
-                )
-                if selected_item == ("track", index):
-                    selected_row = len(self.library_items) - 1
-                    self.library_list.selection_set(selected_row)
-            if not self.songs:
-                self.library_list.insert(tk.END, "Load a folder to see tracks.")
+                items.append(("track", identity))
+                labels.append(f"♪  {os.path.basename(song)}  ·  {folder}")
+            empty_label = "Load a folder to see tracks."
         elif category == "Folders":
-            folder_counts = Counter(os.path.dirname(song) for song in self.songs)
-            for folder, count in sorted(
-                folder_counts.items(),
-                key=lambda item: item[0].casefold()
-            ):
-                self.library_items.append(("folder", folder))
+            counts = Counter(os.path.dirname(song) for song in self.songs)
+            for folder, count in sorted(counts.items(), key=lambda item: item[0].casefold()):
+                items.append(("folder", folder))
                 name = os.path.basename(folder) or folder
-                self.library_list.insert(
-                    tk.END,
-                    f"▸  {name}  ·  {count} track"
-                    f"{'s' if count != 1 else ''}"
-                )
-                if selected_item == ("folder", folder):
-                    selected_row = len(self.library_items) - 1
-                    self.library_list.selection_set(selected_row)
-            if not self.library_items:
-                self.library_list.insert(tk.END, "No folders in your library.")
+                labels.append(f"▸  {name}  ·  {count} track{'s' if count != 1 else ''}")
+            empty_label = "No folders in your library."
         else:
             if self.songs:
-                self.library_items.append(("playlist", self.current_playlist_name))
-                self.library_list.insert(
-                    tk.END,
-                    f"♫  {self.current_playlist_name}  ·  "
-                    f"{len(self.songs)} track"
-                    f"{'s' if len(self.songs) != 1 else ''}"
-                )
-                if selected_item == ("playlist", self.current_playlist_name):
-                    self.library_list.selection_set(0)
-            else:
-                self.library_list.insert(
-                    tk.END,
-                    "Open or load a playlist to see it here."
-                )
-
-        self.library_count.config(
-            text=f"{len(self.songs)} track"
-            f"{'s' if len(self.songs) != 1 else ''}"
-        )
+                items.append(("playlist", self.current_playlist_name))
+                count = len(self.songs)
+                labels.append(f"♫  {self.current_playlist_name}  ·  {count} track{'s' if count != 1 else ''}")
+            empty_label = "Open or load a playlist to see it here."
+        self.library_items = items
+        self.library_list.delete(0, tk.END)
+        self.library_list.insert(tk.END, *(labels or [empty_label]))
+        if selected in items:
+            self.library_list.selection_set(items.index(selected))
+        count = len(self.songs)
+        text = f"{count} track{'s' if count != 1 else ''}"
         if self.library_folder_filter is not None:
-            self.library_count.config(
-                text=f"{self.library_count.cget('text')} · folder filtered"
-            )
+            text += " · folder filtered"
+        self.library_count.config(text=text)
 
     def select_library_item(self, _event=None):
         selection = self.library_list.curselection()
         if not selection or selection[0] >= len(self.library_items):
             return
-
         item_type, value = self.library_items[selection[0]]
         if item_type == "track":
+            index = self.song_index_by_id.get(value)
+            if index is None:
+                return
             self.library_folder_filter = None
             self.set_search_query("")
-            self.refresh_playlist(preferred_index=value)
-            if value in self.displayed_song_indices:
-                row = self.displayed_song_indices.index(value)
+            self.refresh_playlist(preferred_index=index)
+            if index in self.displayed_song_indices:
+                row = self.displayed_song_indices.index(index)
                 self.playlist.selection_clear(0, tk.END)
                 self.playlist.selection_set(row)
                 self.playlist.activate(row)
@@ -828,11 +916,8 @@ class MP3Player:
             self.library_folder_filter = value
             self.refresh_playlist()
             self.status.set(f"Showing tracks from {os.path.basename(value)}.")
-            self.library_count.config(
-                text=f"{len(self.displayed_song_indices)} track"
-                f"{'s' if len(self.displayed_song_indices) != 1 else ''}"
-                " in folder"
-            )
+            count = len(self.displayed_song_indices)
+            self.library_count.config(text=f"{count} track{'s' if count != 1 else ''} in folder")
         elif item_type == "playlist":
             self.library_folder_filter = None
             self.refresh_playlist()
@@ -841,10 +926,11 @@ class MP3Player:
         selection = self.library_list.curselection()
         if not selection or selection[0] >= len(self.library_items):
             return
-
         item_type, value = self.library_items[selection[0]]
         if item_type == "track":
-            self.play_song_index(value)
+            index = self.song_index_by_id.get(value)
+            if index is not None:
+                self.play_song_index(index)
         elif item_type == "folder":
             self.set_library_category("Tracks")
             self.library_folder_filter = value
@@ -858,8 +944,8 @@ class MP3Player:
             return
 
         self.root.update_idletasks()
-        user32 = ctypes.windll.user32
-        hwnd = ctypes.c_void_p(self.root.winfo_id())
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        hwnd = ctypes.c_void_p(self.get_window_handle())
         pointer_suffix = "PtrW" if ctypes.sizeof(ctypes.c_void_p) == 8 else "W"
         get_window_long = getattr(
             user32, f"GetWindowLong{pointer_suffix}"
@@ -876,10 +962,16 @@ class MP3Player:
         )
         set_window_long.restype = ctypes.c_ssize_t
 
-        style = get_window_long(hwnd, -16)
+        ctypes.set_last_error(0)
+        original_style = get_window_long(hwnd, -16)
+        if not original_style and ctypes.get_last_error():
+            raise ctypes.WinError(ctypes.get_last_error())
+        style = original_style
         style &= ~0x00C00000
         style |= 0x00040000 | 0x00080000 | 0x00020000 | 0x00010000
-        set_window_long(hwnd, -16, style)
+        ctypes.set_last_error(0)
+        if not set_window_long(hwnd, -16, style) and ctypes.get_last_error():
+            raise ctypes.WinError(ctypes.get_last_error())
 
         set_window_pos = user32.SetWindowPos
         set_window_pos.argtypes = (
@@ -893,12 +985,25 @@ class MP3Player:
         )
         set_window_pos.restype = ctypes.c_int
         if not set_window_pos(hwnd, None, 0, 0, 0, 0, 0x0027):
+            error = ctypes.get_last_error()
+            set_window_long(hwnd, -16, original_style)
+            raise ctypes.WinError(error)
+
+    def get_window_handle(self):
+        user32 = ctypes.windll.user32
+        ancestor = user32.GetAncestor
+        ancestor.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+        ancestor.restype = ctypes.c_void_p
+        # Tk's winfo_id is its client window; GA_ROOT returns the WM wrapper.
+        hwnd = ancestor(self.root.winfo_id(), 2)
+        if not hwnd:
             raise ctypes.WinError()
+        return hwnd
 
     def start_window_drag(self, event=None):
         if sys.platform == "win32":
             user32 = ctypes.windll.user32
-            hwnd = ctypes.c_void_p(self.root.winfo_id())
+            hwnd = ctypes.c_void_p(self.get_window_handle())
             user32.ReleaseCapture.restype = ctypes.c_int
             send_message = user32.SendMessageW
             send_message.argtypes = (
@@ -927,12 +1032,18 @@ class MP3Player:
         self.root.iconify()
 
     def toggle_maximize_window(self):
-        if self.root.state() == "zoomed":
-            self.root.state("normal")
-            self.window_controls.winfo_children()[1].configure(text="□")
-        else:
-            self.root.state("zoomed")
-            self.window_controls.winfo_children()[1].configure(text="❐")
+        try:
+            maximized = self.root.state() != "zoomed"
+            self.root.state("zoomed" if maximized else "normal")
+        except tk.TclError:
+            # X11 exposes maximization as an attribute instead of a WM state.
+            try:
+                maximized = not bool(self.root.attributes("-zoomed"))
+                self.root.attributes("-zoomed", maximized)
+            except tk.TclError:
+                self.status.set("Window maximization is unavailable on this system.")
+                return
+        self.window_controls.winfo_children()[1].configure(text="❐" if maximized else "□")
 
     def go_home(self):
         self.set_search_query("")
@@ -973,6 +1084,8 @@ class MP3Player:
             menu.grab_release()
 
     def build_app_menu(self):
+        if self.app_menu is not None:
+            return self.app_menu
         menu_style = {
             "tearoff": False,
             "bg": "#181818",
@@ -1052,6 +1165,25 @@ class MP3Player:
             command=self.next_music
         )
         playback_menu.add_separator()
+        playback_menu.add_checkbutton(
+            label="Shuffle",
+            variable=self.shuffle_var,
+            command=lambda: self.set_shuffle(self.shuffle_var.get())
+        )
+        repeat_menu = tk.Menu(playback_menu, **menu_style)
+        for mode, label in (
+            (RepeatMode.OFF, "Off"),
+            (RepeatMode.ALL, "Repeat all"),
+            (RepeatMode.ONE, "Repeat one")
+        ):
+            repeat_menu.add_radiobutton(
+                label=label,
+                variable=self.repeat_var,
+                value=mode.value,
+                command=lambda selected=mode: self.set_repeat_mode(selected)
+            )
+        playback_menu.add_cascade(label="Repeat", menu=repeat_menu)
+        playback_menu.add_separator()
         playback_menu.add_command(
             label="Volume up",
             command=lambda: self.adjust_volume(10)
@@ -1066,6 +1198,7 @@ class MP3Player:
         help_menu.add_command(label="Help", command=self.show_help)
         help_menu.add_command(label="About MP3 Player", command=self.show_about)
         menu.add_cascade(label="Help", menu=help_menu)
+        self.app_menu = menu
         return menu
 
     def adjust_volume(self, delta):
@@ -1094,113 +1227,86 @@ class MP3Player:
         minutes, remaining_seconds = divmod(total_seconds, 60)
         return f"{minutes}:{remaining_seconds:02d}"
 
-    def read_track_metadata(self, path):
-        try:
-            audio = MP3(path)
-        except (MutagenError, OSError):
-            return None, None
-
-        duration = audio.info.length
-        cover_data = None
-        if audio.tags:
-            artwork = audio.tags.getall("APIC")
-            if artwork:
-                front_cover = next(
-                    (image for image in artwork if image.type == 3),
-                    artwork[0]
-                )
-                cover_data = front_cover.data
-        return (duration if duration > 0 else None), cover_data
+    @staticmethod
+    def read_track_metadata(path):
+        return read_track_metadata(path)
 
     def update_cover_art(self, path):
-        if path == self.cover_path:
+        key = (path, id(self.cover_thumbnail))
+        if key == getattr(self, "displayed_cover_key", None):
             return
-
-        self.cover_path = path
+        self.displayed_cover_key = key
         self.cover_image = None
-        if path and self.cover_data:
-            try:
-                with Image.open(BytesIO(self.cover_data)) as image:
-                    cover = image.convert("RGB")
-                    cover.thumbnail((58, 58), Image.Resampling.LANCZOS)
-                    self.cover_image = ImageTk.PhotoImage(cover)
-            except (UnidentifiedImageError, OSError):
-                self.cover_image = None
-
-        if self.cover_image:
-            self.cover_art.config(image=self.cover_image, text="")
+        self.large_cover_image = None
+        if path and self.cover_thumbnail is not None:
+            small = self.cover_thumbnail.copy()
+            small.thumbnail((58, 58), Image.Resampling.LANCZOS)
+            self.cover_image = ImageTk.PhotoImage(small, master=self.root)
+            self.large_cover_image = ImageTk.PhotoImage(self.cover_thumbnail, master=self.root)
+            self.cover_art.config(image=self.cover_image, text="", width=58, height=58)
+            self.large_cover_art.config(image=self.large_cover_image, text="", width=180, height=180)
         else:
-            self.cover_art.config(image="", text="♫")
+            self.cover_art.config(image="", text="♫", width=3, height=2)
+            self.large_cover_art.config(image="", text="MP3", width=8, height=5)
 
     def current_position(self):
-        if (
-            self.playback_started_at is not None
-            and not self.paused
-        ):
-            position = self.playback_position + (
-                time.monotonic() - self.playback_started_at
-            )
-        else:
-            position = self.playback_position
-        if self.track_duration is not None:
-            position = min(position, self.track_duration)
-        return max(0.0, position)
+        return self.playback.position()
 
     def update_progress(self):
+        self.progress_after_id = None
+        if self.closing:
+            return
         if self.current_song:
-            is_busy = pygame.mixer.music.get_busy()
-            if not self.paused and not is_busy:
-                self.playback_position = (
-                    self.track_duration
-                    if self.track_duration is not None
-                    else self.current_position()
-                )
-                self.playback_started_at = None
-                position = self.playback_position
-            else:
-                position = self.current_position()
-
+            if self.playback.poll_finished():
+                next_identity = self.playlist_queue.next_track(automatic=True)
+                next_index = self.song_index_by_id.get(next_identity)
+                if next_index is not None:
+                    self.refresh_playlist(preferred_index=next_index)
+                    self.play_song_index(next_index)
+                else:
+                    self.status.set("Playlist finished.")
+            position = self.current_position()
             if not self.seeking:
                 self.seek_var.set(position)
-            self.elapsed_label.config(
-                text=self.format_time(position)
-            )
+                self.elapsed_label.config(text=self.format_time(position))
             self.playback_button.config(
-                text="Ⅱ" if is_busy and not self.paused else "▶"
+                text="Ⅱ" if self.playback.state == PlaybackState.PLAYING else "▶"
             )
         self.progress_after_id = self.root.after(250, self.update_progress)
 
     def begin_seek(self, _event=None):
-        self.seeking = True
+        self.seeking = self.current_song is not None and self.track_duration is not None
 
     def on_seek_drag(self, value):
         self.elapsed_label.config(text=self.format_time(float(value)))
+
+    def seek_with_keyboard(self, event):
+        if self.track_duration is None or self.current_song is None:
+            return "break"
+        offsets = {"Left": -5, "Down": -5, "Right": 5, "Up": 5, "Prior": 10, "Next": -10}
+        if event.keysym == "Home":
+            position = 0
+        elif event.keysym == "End":
+            position = self.track_duration
+        else:
+            position = self.current_position() + offsets[event.keysym]
+        self.seek_var.set(max(0, min(position, self.track_duration)))
+        self.seek_music()
+        return "break"
 
     def seek_music(self, _event=None):
         self.seeking = False
         if self.track_duration is None or self.current_song is None:
             return
-
-        position = min(float(self.seek_var.get()), self.track_duration)
         try:
-            pygame.mixer.music.set_pos(position)
-        except pygame.error as error:
-            self.playback_position = self.current_position()
-            self.seek_var.set(self.playback_position)
-            self.elapsed_label.config(
-                text=self.format_time(self.playback_position)
-            )
-            messagebox.showerror(
-                "Seeking Error",
-                f"Could not seek within this track:\n{error}",
-                parent=self.root
-            )
-            return
-
-        self.playback_position = position
-        self.playback_started_at = (
-            None if self.paused else time.monotonic()
-        )
+            self.playback.seek(self.seek_var.get())
+        except (pygame.error, NotImplementedError) as error:
+            self.status.set(f"Could not seek within this track: {error}")
+            messagebox.showerror("Seeking Error", f"Could not seek within this track:\n{error}", parent=self.root)
+        else:
+            state = "Paused" if self.paused else "Playing"
+            self.status.set(f"{state}: {os.path.basename(self.current_song)}")
+        self.update_track_display()
 
     def on_volume_pointer(self, event):
         minimum_x = self.volume_scale.coords(0)[0]
@@ -1215,21 +1321,22 @@ class MP3Player:
         return "break"
 
     def set_volume(self, value):
-        volume_level = max(0.0, min(100.0, float(value)))
+        volume = max(0.0, min(100.0, float(value)))
         try:
-            pygame.mixer.music.set_volume(volume_level / 100)
+            self.playback.set_volume(volume)
         except pygame.error as error:
             self.status.set(f"Could not change playback volume: {error}")
             return
-
-        self.volume_level = volume_level
+        self.volume_level = volume
         self.schedule_volume_save()
 
     def toggle_playback(self):
-        if self.current_song:
+        if self.pending_track_id is not None:
+            self.stop_music()
+        elif self.current_song:
             if self.paused:
                 self.resume_music()
-            elif pygame.mixer.music.get_busy():
+            elif self.playback.state == PlaybackState.PLAYING:
                 self.pause_music()
             elif self.current_song_index is not None:
                 self.play_song_index(self.current_song_index)
@@ -1245,7 +1352,7 @@ class MP3Player:
             self.now_playing_location.config(text=location)
             self.bottom_track_title.config(text=title)
             self.bottom_track_location.config(text=location)
-            self.playback_button.config(text="Ⅱ" if not self.paused else "▶")
+            self.playback_button.config(text="Ⅱ" if self.playback.state == PlaybackState.PLAYING else "▶")
         else:
             self.update_cover_art(None)
             self.now_playing_title.config(text="Nothing playing")
@@ -1269,62 +1376,21 @@ class MP3Player:
         else:
             self.seek_scale.configure(to=1, state=tk.DISABLED)
             self.duration_label.config(text="--:--")
-        self.seek_var.set(self.playback_position)
-        self.elapsed_label.config(text=self.format_time(self.playback_position))
+        self.seek_var.set(self.current_position())
+        self.elapsed_label.config(text=self.format_time(self.current_position()))
 
-        self.refresh_library()
 
     def load_music(self):
         directory = filedialog.askdirectory(parent=self.root)
-
         if not directory:
             return
-
-        try:
-            # Store full paths so playback never depends on the
-            # application's current working directory.
-            songs = [
-                os.path.join(directory, name)
-                for name in os.listdir(directory)
-                if name.lower().endswith(".mp3")
-                and os.path.isfile(os.path.join(directory, name))
-            ]
-        except OSError as error:
-            messagebox.showerror(
-                "Folder Error",
-                f"Could not read this folder:\n{error}",
-                parent=self.root
-            )
-            return
-
-        self.stop_music()
-        self.songs = songs.copy()
-        self.folder_order = songs.copy()
-        self.current_playlist_name = os.path.basename(
-            os.path.normpath(directory)
+        self.status.set("Loading music folder...")
+        self.submit_file_job(
+            "library", lambda: scan_music_folder(directory),
+            lambda songs: self.install_library(
+                songs, songs, "name_asc", os.path.basename(os.path.normpath(directory))
+            ), "load this music folder"
         )
-        self.library_folder_filter = None
-        self.displayed_song_indices = []
-        self.displayed_songs = []
-        self.playlist.delete(0, tk.END)
-        self.set_library_category("Tracks")
-        self.sort_order = "name_asc"
-        self.sort_var.set("Name (A-Z)")
-        self.set_search_query("")
-        self.apply_sort_order()
-        self.update_track_display()
-
-        if self.songs:
-            self.playlist.selection_set(0)
-            self.playlist.activate(0)
-            self.status.set(f"Loaded {len(self.songs)} MP3 file(s).")
-        else:
-            self.status.set("No MP3 files found in this folder.")
-            messagebox.showinfo(
-                "MP3 Player",
-                "No MP3 files found in the selected folder.",
-                parent=self.root
-            )
 
     def filter_playlist(self, *_):
         if self.search_placeholder_visible:
@@ -1346,119 +1412,66 @@ class MP3Player:
         self.status.set(f"Playlist sorted by {self.sort_var.get()}.")
 
     def apply_sort_order(self):
-        original_songs = self.songs
-        original_current_index = self.current_song_index
+        original_ids = track_ids(self.songs)
+        def identity_at(index):
+            return original_ids[index] if index is not None and 0 <= index < len(original_ids) else None
+        current_id = identity_at(self.current_song_index)
         selection = self.playlist.curselection()
-        original_selected_index = (
+        selected_id = identity_at(
             self.displayed_song_indices[selection[0]]
-            if selection and selection[0] < len(self.displayed_song_indices)
-            else None
+            if selection and selection[0] < len(self.displayed_song_indices) else None
         )
-        source = self.folder_order or original_songs
-        indexed_songs = list(enumerate(source))
-
-        if self.sort_order == "name_asc":
-            indexed_songs.sort(
-                key=lambda item: os.path.basename(item[1]).casefold()
-            )
-        elif self.sort_order == "name_desc":
-            indexed_songs.sort(
-                key=lambda item: os.path.basename(item[1]).casefold(),
-                reverse=True
-            )
-
-        self.songs = [song for _, song in indexed_songs]
+        source = self.folder_order or self.songs
+        self.songs = list(source)
         self.folder_order = list(source)
-        def remap_index(index):
-            if index is None or index >= len(original_songs):
-                return None
-            song = original_songs[index]
-            occurrence = original_songs[:index + 1].count(song) - 1
-            matching_indexes = [
-                new_index for new_index, candidate in enumerate(self.songs)
-                if candidate == song
-            ]
-            return (
-                matching_indexes[occurrence]
-                if occurrence < len(matching_indexes) else None
+        if self.sort_order in ("name_asc", "name_desc"):
+            self.songs.sort(
+                key=lambda song: os.path.basename(song).casefold(),
+                reverse=self.sort_order == "name_desc"
             )
-
-        self.current_song_index = remap_index(original_current_index)
-        selected_index = remap_index(original_selected_index)
-        self.refresh_playlist(
-            preferred_index=(
-                self.current_song_index
-                if self.current_song_index is not None
-                else selected_index
-            )
-        )
+        self.song_ids = track_ids(self.songs)
+        self.song_index_by_id = {identity: index for index, identity in enumerate(self.song_ids)}
+        self.current_song_index = self.song_index_by_id.get(current_id)
+        selected_index = self.song_index_by_id.get(selected_id)
+        self.playlist.selection_clear(0, tk.END)
+        self.refresh_playlist(preferred_index=(
+            self.current_song_index if self.current_song_index is not None else selected_index
+        ))
+        self.playlist_queue.update_tracks(self.song_ids)
+        self.refresh_library()
 
     def refresh_playlist(self, preferred_song=None, preferred_index=None):
         selection = self.playlist.curselection()
         selected_index = (
             self.displayed_song_indices[selection[0]]
-            if selection and selection[0] < len(self.displayed_song_indices)
-            else None
+            if selection and selection[0] < len(self.displayed_song_indices) else None
         )
         target_index = preferred_index
         if target_index is None:
-            target_song = preferred_song
-            if target_song is None and selected_index is not None:
-                target_song = self.songs[selected_index]
-            if target_song is not None:
-                target_index = next(
-                    (
-                        index for index, song in enumerate(self.songs)
-                        if song == target_song
-                    ),
-                    None
-                )
-        query = (
-            ""
-            if self.search_placeholder_visible
-            else self.search_var.get().strip().casefold()
-        )
-        folder_filter = (
+            target_index = selected_index
+            if preferred_song is not None:
+                target_index = next((i for i, song in enumerate(self.songs) if song == preferred_song), None)
+        query = "" if self.search_placeholder_visible else self.search_var.get().strip().casefold()
+        folder = (
             os.path.normcase(os.path.abspath(self.library_folder_filter))
-            if self.library_folder_filter is not None
-            else None
+            if self.library_folder_filter is not None else None
         )
         self.displayed_song_indices = [
             index for index, song in enumerate(self.songs)
             if query in os.path.basename(song).casefold()
-            and (
-                folder_filter is None
-                or os.path.normcase(os.path.abspath(os.path.dirname(song)))
-                == folder_filter
-            )
+            and (folder is None or os.path.normcase(os.path.abspath(os.path.dirname(song))) == folder)
         ]
-        self.displayed_songs = [
-            self.songs[index] for index in self.displayed_song_indices
-        ]
-
-        basenames = Counter(
-            os.path.basename(song).casefold()
+        self.displayed_songs = [self.songs[index] for index in self.displayed_song_indices]
+        counts = Counter(os.path.basename(song).casefold() for song in self.displayed_songs)
+        labels = [
+            song if counts[os.path.basename(song).casefold()] > 1 else os.path.basename(song)
             for song in self.displayed_songs
-        )
-        duplicate_basenames = {
-            name for name, count in basenames.items() if count > 1
-        }
-
+        ]
         self.playlist.delete(0, tk.END)
-        for song in self.displayed_songs:
-            basename = os.path.basename(song)
-            label = (
-                song if basename.casefold() in duplicate_basenames
-                else basename
-            )
-            self.playlist.insert(tk.END, label)
-
+        if labels:
+            self.playlist.insert(tk.END, *labels)
         if target_index not in self.displayed_song_indices:
-            target_index = (
-                self.current_song_index
-                if self.current_song_index in self.displayed_song_indices
-                else None
-            )
+            target_index = self.current_song_index
         if target_index in self.displayed_song_indices:
             row = self.displayed_song_indices.index(target_index)
             self.playlist.selection_set(row)
@@ -1466,151 +1479,40 @@ class MP3Player:
 
     def save_playlist(self):
         if not self.songs:
-            messagebox.showinfo(
-                "MP3 Player",
-                "Load or open a playlist before saving.",
-                parent=self.root
-            )
+            messagebox.showinfo("MP3 Player", "Load or open a playlist before saving.", parent=self.root)
             return
-
         path = filedialog.asksaveasfilename(
-            parent=self.root,
-            title="Save Playlist",
-            defaultextension=".json",
+            parent=self.root, title="Save Playlist", defaultextension=".json",
             filetypes=(("JSON playlist", "*.json"), ("All files", "*.*"))
         )
         if not path:
             return
-
-        playlist_data = {
-            "version": 1,
-            "songs": self.songs,
-            "folder_order": self.folder_order,
-            "sort_order": self.sort_order
-        }
+        data = {"version": 1, "songs": self.songs, "folder_order": self.folder_order, "sort_order": self.sort_order}
         try:
-            with open(path, "w", encoding="utf-8") as playlist_file:
-                json.dump(playlist_data, playlist_file, indent=2)
-                playlist_file.write("\n")
-        except OSError as error:
-            messagebox.showerror(
-                "Playlist Error",
-                f"Could not save this playlist:\n{error}",
-                parent=self.root
-            )
+            write_json_atomic(path, data)
+        except (OSError, ValueError, TypeError) as error:
+            messagebox.showerror("Playlist Error", f"Could not save this playlist:\n{error}", parent=self.root)
             return
-
-        self.current_playlist_name = os.path.splitext(
-            os.path.basename(path)
-        )[0]
+        self.current_playlist_name = Path(path).stem
         self.refresh_library()
         self.status.set(f"Saved playlist: {os.path.basename(path)}")
 
     def open_playlist(self):
         path = filedialog.askopenfilename(
-            parent=self.root,
-            title="Open Playlist",
+            parent=self.root, title="Open Playlist",
             filetypes=(("JSON playlist", "*.json"), ("All files", "*.*"))
         )
         if not path:
             return
-
-        try:
-            with open(path, "r", encoding="utf-8") as playlist_file:
-                playlist_data = json.load(playlist_file)
-            songs, folder_order, sort_order = self.validate_playlist(
-                playlist_data,
-                os.path.dirname(os.path.abspath(path))
-            )
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
-            messagebox.showerror(
-                "Playlist Error",
-                f"Could not open this playlist:\n{error}",
-                parent=self.root
-            )
-            return
-
-        missing_songs = [song for song in songs if not os.path.isfile(song)]
-        available_songs = [song for song in songs if os.path.isfile(song)]
-        available_folder_order = [
-            song for song in folder_order if os.path.isfile(song)
-        ]
-
-        self.stop_music()
-        self.songs = available_songs
-        self.folder_order = available_folder_order
-        self.displayed_song_indices = []
-        self.displayed_songs = []
-        self.playlist.delete(0, tk.END)
-        self.current_playlist_name = os.path.splitext(
-            os.path.basename(path)
-        )[0]
-        self.library_folder_filter = None
-        self.set_library_category("Tracks")
-        self.sort_order = sort_order
-        self.sort_var.set({
-            "name_asc": "Name (A-Z)",
-            "name_desc": "Name (Z-A)",
-            "folder": "Folder order"
-        }[sort_order])
-        self.current_song_index = None
-        self.set_search_query("")
-        self.apply_sort_order()
-        if self.songs:
-            self.playlist.selection_set(0)
-            self.playlist.activate(0)
-        self.update_track_display()
-        self.status.set(f"Loaded {len(self.songs)} song(s) from playlist.")
-
-        if missing_songs:
-            preview = "\n".join(os.path.basename(song) for song in missing_songs[:5])
-            remainder = (
-                f"\n...and {len(missing_songs) - 5} more."
-                if len(missing_songs) > 5 else ""
-            )
-            messagebox.showwarning(
-                "Missing Music Files",
-                f"{len(missing_songs)} file(s) could not be found and were "
-                f"skipped:\n{preview}{remainder}",
-                parent=self.root
-            )
+        self.status.set("Opening playlist...")
+        self.submit_file_job(
+            "library", lambda: read_playlist(path),
+            lambda result: self.playlist_loaded(path, result), "open this playlist"
+        )
 
     @staticmethod
     def validate_playlist(data, playlist_directory):
-        if not isinstance(data, dict) or type(data.get("version")) is not int:
-            raise ValueError("The playlist must be a versioned JSON object.")
-        if data["version"] != 1:
-            raise ValueError(
-                f"Unsupported playlist version: {data['version']}."
-            )
-
-        songs = data.get("songs")
-        folder_order = data.get("folder_order")
-        sort_order = data.get("sort_order")
-        valid_orders = {"name_asc", "name_desc", "folder"}
-        if (
-            not isinstance(songs, list)
-            or not all(isinstance(song, str) and song for song in songs)
-            or not isinstance(folder_order, list)
-            or not all(
-                isinstance(song, str) and song for song in folder_order
-            )
-            or sorted(songs) != sorted(folder_order)
-            or not isinstance(sort_order, str)
-            or sort_order not in valid_orders
-        ):
-            raise ValueError("The playlist contains invalid data.")
-
-        def resolve_paths(paths):
-            return [
-                os.path.abspath(
-                    song if os.path.isabs(song)
-                    else os.path.join(playlist_directory, song)
-                )
-                for song in paths
-            ]
-
-        return resolve_paths(songs), resolve_paths(folder_order), sort_order
+        return validate_playlist(data, playlist_directory)
 
     def play_music(self, event=None):
         selection = self.playlist.curselection()
@@ -1627,46 +1529,18 @@ class MP3Player:
         self.play_song_index(song_index)
 
     def play_song_index(self, song_index):
+        if not 0 <= song_index < len(self.songs):
+            return
+        identity = self.song_ids[song_index]
+        self.playlist_queue.select(identity)
         song = self.songs[song_index]
-        duration, cover_data = self.read_track_metadata(song)
-
-        try:
-            pygame.mixer.music.stop()
-            self.current_song = None
-            self.current_song_index = None
-            self.paused = False
-            self.playback_position = 0.0
-            self.playback_started_at = None
-
-            pygame.mixer.music.load(song)
-            pygame.mixer.music.set_volume(self.volume_level / 100)
-            pygame.mixer.music.play()
-
-            self.current_song = song
-            self.current_song_index = song_index
-            self.track_duration = duration
-            self.cover_data = cover_data
-            self.playback_started_at = time.monotonic()
-            self.update_track_display()
-            status = f"Playing: {os.path.basename(song)}"
-            if duration is None:
-                status += " (duration unavailable; seeking disabled)"
-            self.status.set(status)
-        except (pygame.error, OSError) as error:
-            self.current_song = None
-            self.current_song_index = None
-            self.track_duration = None
-            self.cover_data = None
-            self.playback_position = 0.0
-            self.playback_started_at = None
-            self.paused = False
-            self.update_track_display()
-            self.status.set("Playback failed.")
-            messagebox.showerror(
-                "Playback Error",
-                f"Could not play this file:\n{error}",
-                parent=self.root
-            )
+        self.stop_music()
+        self.pending_track_id = identity
+        self.status.set(f"Loading: {os.path.basename(song)}")
+        self.submit_file_job(
+            "track", lambda: self.read_track_metadata(song),
+            lambda metadata: self.play_prepared_track(identity, metadata), "read this track"
+        )
 
     def previous_music(self):
         self.play_adjacent_song(-1)
@@ -1678,78 +1552,128 @@ class MP3Player:
         if not self.songs:
             self.status.set("Load a folder to get started.")
             return
-
-        if self.current_song_index is not None:
-            current_index = self.current_song_index
-        else:
+        current_identity = self.pending_track_id
+        if current_identity is None and self.current_song_index is not None:
+            current_identity = self.song_ids[self.current_song_index]
+        if current_identity is None:
             selection = self.playlist.curselection()
-            current_index = (
+            selected_index = (
                 self.displayed_song_indices[selection[0]]
                 if selection and selection[0] < len(self.displayed_song_indices)
-                else (-1 if offset > 0 else 0)
+                else 0
             )
-
-        next_index = (current_index + offset) % len(self.songs)
+            self.playlist_queue.select(self.song_ids[selected_index])
+        next_identity = (
+            self.playlist_queue.previous_track()
+            if offset < 0 else self.playlist_queue.next_track()
+        )
+        next_index = self.song_index_by_id.get(next_identity)
+        if next_index is None:
+            return
         self.refresh_playlist(preferred_index=next_index)
         if next_index in self.displayed_song_indices:
             self.playlist.see(self.displayed_song_indices.index(next_index))
         self.play_song_index(next_index)
 
+    def toggle_shuffle(self):
+        self.set_shuffle(not self.playlist_queue.shuffle)
+
+    def set_shuffle(self, enabled):
+        self.playlist_queue.set_shuffle(enabled)
+        self.shuffle_var.set(self.playlist_queue.shuffle)
+        self.update_playback_mode_controls()
+
+    def cycle_repeat_mode(self):
+        modes = (RepeatMode.OFF, RepeatMode.ALL, RepeatMode.ONE)
+        current_index = modes.index(self.playlist_queue.repeat_mode)
+        self.set_repeat_mode(modes[(current_index + 1) % len(modes)])
+
+    def set_repeat_mode(self, mode):
+        self.playlist_queue.set_repeat_mode(mode)
+        self.repeat_var.set(mode.value)
+        self.update_playback_mode_controls()
+
+    def update_playback_mode_controls(self):
+        if not hasattr(self, "shuffle_button"):
+            return
+        self.shuffle_button.configure(
+            bg="#1ed760" if self.playlist_queue.shuffle else "#282828",
+            fg="#101010" if self.playlist_queue.shuffle else "#eeeeee",
+            activebackground="#1ed760" if self.playlist_queue.shuffle else "#3a3a3a"
+        )
+        repeat_label = {
+            RepeatMode.OFF: "RPT",
+            RepeatMode.ALL: "RPT ALL",
+            RepeatMode.ONE: "RPT 1"
+        }[self.playlist_queue.repeat_mode]
+        active = self.playlist_queue.repeat_mode != RepeatMode.OFF
+        self.repeat_button.configure(
+            text=repeat_label,
+            bg="#1ed760" if active else "#282828",
+            fg="#101010" if active else "#eeeeee",
+            activebackground="#1ed760" if active else "#3a3a3a"
+        )
+
     def pause_music(self):
-        if self.current_song and not self.paused:
-            if pygame.mixer.music.get_busy():
-                self.playback_position = self.current_position()
-                pygame.mixer.music.pause()
-                self.paused = True
-                self.playback_started_at = None
-                self.update_track_display()
-                self.status.set(
-                    f"Paused: {os.path.basename(self.current_song)}"
-                )
+        try:
+            changed = self.playback.pause()
+        except pygame.error as error:
+            self.status.set(f"Could not pause playback: {error}")
+            return
+        if changed:
+            self.update_track_display()
+            self.status.set(f"Paused: {os.path.basename(self.current_song)}")
 
     def resume_music(self):
-        if self.current_song and self.paused:
-            pygame.mixer.music.unpause()
-            self.paused = False
-            self.playback_started_at = time.monotonic()
+        try:
+            changed = self.playback.resume()
+        except pygame.error as error:
+            self.status.set(f"Could not resume playback: {error}")
+            return
+        if changed:
             self.update_track_display()
-            self.status.set(
-                f"Playing: {os.path.basename(self.current_song)}"
-            )
+            self.status.set(f"Playing: {os.path.basename(self.current_song)}")
 
     def stop_music(self):
-        pygame.mixer.music.stop()
+        self.cancel_file_job("track")
+        self.pending_track_id = None
+        self.playback.stop()
         self.current_song = None
         self.current_song_index = None
-        self.paused = False
-        self.track_duration = None
-        self.cover_data = None
-        self.playback_position = 0.0
-        self.playback_started_at = None
+        self.cover_thumbnail = None
+        self.seeking = False
         self.update_track_display()
         self.status.set("Stopped.")
 
     def close_app(self):
-        if self.progress_after_id is not None:
-            self.root.after_cancel(self.progress_after_id)
+        if self.closing:
+            return
+        self.closing = True
+        self.ready = False
+        for timer in (self.progress_after_id, self.background_after_id, self.volume_save_after_id):
+            if timer is not None:
+                self.root.after_cancel(timer)
         if self.volume_save_after_id is not None:
-            self.root.after_cancel(self.volume_save_after_id)
             self.volume_save_after_id = None
             try:
                 self.save_volume_setting()
             except OSError as error:
-                messagebox.showwarning(
-                    "Volume Settings",
-                    f"Could not save volume settings:\n{error}",
-                    parent=self.root
-                )
-        pygame.mixer.quit()
+                messagebox.showwarning("Volume Settings", f"Could not save volume settings:\n{error}", parent=self.root)
+        for kind in list(self.background_jobs):
+            self.cancel_file_job(kind)
+        if self.executor is not None:
+            self.executor.shutdown(wait=False, cancel_futures=True)
+        self.playback.shutdown()
         self.root.destroy()
 
 
-if __name__ == "__main__":
+def run():
     root = tk.Tk()
     app = MP3Player(root)
 
-    if root.winfo_exists():
+    if app.ready:
         root.mainloop()
+
+
+if __name__ == "__main__":
+    run()
